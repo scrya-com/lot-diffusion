@@ -388,6 +388,9 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=0, help="0 = save only at the end")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "train_dir_h3")
+    parser.add_argument("--resume-step", type=int, default=0,
+                        help="continue the run in --out from its step-N save (lora_gen_N, lora_fake_N, dir_head_N, "
+                             "dir_fake_head_N, *_N_ema, adapter_N); optimizer state is not saved and restarts")
     parser.add_argument("--check", action="store_true",
                         help="one generator + one fake update per distinct schedule entry, grads and memory printed, "
                              "no optimizer step, writes nothing; allowed without LOT_H3_TRAIN")
@@ -470,7 +473,32 @@ def main() -> None:
     }
     gen_params = param_groups["gen_lora"] + param_groups["dir_head"] + adapter_params
     fake_params = param_groups["fake_lora"] + param_groups["fake_head"]
-    ema = Ema(gen_params, args.ema) if args.ema > 0 else None
+    if args.resume_step:
+        # With the paper's betas (0, 0.95) Adam remembers ~20 steps, so a fresh optimizer costs little.
+        def load_gen(tag):
+            info = gen_net.load_weights(str(args.out / f"lora_gen{tag}.safetensors"))
+            if info.missing_keys:
+                raise RuntimeError(f"resume: lora_gen{tag} is missing {len(info.missing_keys)} keys")
+            head.load_state_dict(torch.load(args.out / f"dir_head{tag}.pt", map_location=device, weights_only=True))
+            if adapter is not None and (args.out / f"adapter{tag}.pt").is_file():
+                adapter.load_state_dict(torch.load(args.out / f"adapter{tag}.pt", map_location=device, weights_only=True))
+
+        tag = f"_{args.resume_step}"
+        if args.ema > 0 and (args.out / f"lora_gen{tag}_ema.safetensors").is_file():
+            load_gen(f"{tag}_ema")                     # seed the EMA shadow with the saved average
+            ema = Ema(gen_params, args.ema)
+        else:
+            ema = None
+        load_gen(tag)
+        if args.ema > 0 and ema is None:
+            ema = Ema(gen_params, args.ema)
+        info = fake_net.load_weights(str(args.out / f"lora_fake{tag}.safetensors"))
+        if info.missing_keys:
+            raise RuntimeError(f"resume: lora_fake{tag} is missing {len(info.missing_keys)} keys")
+        fake_head.load_state_dict(torch.load(args.out / f"dir_fake_head{tag}.pt", map_location=device, weights_only=True))
+        print(f"LOT_H3 kind=dir_resume step={args.resume_step} from={args.out}", flush=True)
+    else:
+        ema = Ema(gen_params, args.ema) if args.ema > 0 else None
     print(f"LOT_H3 kind=dir_start items={len(train_items)} holdout={len(held_items)} iterations={args.iterations} "
           f"schedule={args.schedule} gen_lora_modules={len(gen_net.unet_loras)} fake_lora_modules={len(fake_net.unet_loras)} "
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
@@ -540,9 +568,10 @@ def main() -> None:
         print(f"LOT_H3 kind=dir_eval step={step} change={record['eval']['change']} "
               f"fake_real={record['eval']['fake_real']} hat_real={record['eval']['hat_real']}", flush=True)
 
-    evaluate(0)
+    if not args.resume_step:
+        evaluate(0)
     started = time.perf_counter()
-    for step in range(1, args.steps + 1):
+    for step in range(args.resume_step + 1, args.steps + 1):
         # One generator update = --accum samples (each its own prompt, noise, r and tau), grads
         # summed with 1/accum so the step matches a batch of that size. Batch 1 is the H3 runtime's limit.
         gen_opt.zero_grad(set_to_none=True)
@@ -592,7 +621,7 @@ def main() -> None:
             log.flush()
             print(f"LOT_H3 kind=dir step={step} r={r} dmd={stats['dmd']:.4g} fake_loss={record['fake_loss']:.4f} "
                   f"fake_real={stats['fake_real']:.4f} hat_real={stats['hat_real']:.4f} grad_norm={record['grad_norm']:.3g} "
-                  f"s_per_step={(time.perf_counter() - started) / step:.2f} "
+                  f"s_per_step={(time.perf_counter() - started) / (step - args.resume_step):.2f} "
                   f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
         if args.eval_every and step % args.eval_every == 0:
             evaluate(step)
