@@ -42,7 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lot_paths import LOT_H3_CHECKPOINT, LOT_H3_VAE  # noqa: E402
 
 from gpu_guard import refuse_if_busy  # noqa: E402
-from render_h3 import HEIGHT, WIDTH, grid, load_prompts, to_image  # noqa: E402
+from render_h3 import HEIGHT as _H, WIDTH as _W, grid, load_prompts, to_image  # noqa: E402
+
+HEIGHT, WIDTH = _H, _W   # --size overrides
 
 DEFAULT_R = 4
 
@@ -52,14 +54,14 @@ def read_config(run: Path | None) -> dict:
     return json.loads(path.read_text()) if path is not None and path.is_file() else {}
 
 
-def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False):
+def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False, tag: str = ""):
     """``(head, gen_network, adapter_state)`` of a trained run. The one function to adapt to the trainer."""
     from safetensors import safe_open
 
     from dir_h3 import DirHead, probe_temb_dim
     from h3_musubi import make_lora
 
-    sfx = "_ema" if ema else ""
+    sfx = tag + ("_ema" if ema else "")
     lora_path = run / f"lora_gen{sfx}.safetensors"
     if not lora_path.is_file():
         raise SystemExit(f"{lora_path} not found" + (" (the run was trained without --ema)" if ema else ""))
@@ -99,6 +101,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "render_dir")
     parser.add_argument("--swap", type=int, default=0, help="blocks streamed from CPU (0 = all resident)")
     parser.add_argument("--rank", type=int, default=None, help="gen LoRA rank if the file and config.json lack it")
+    parser.add_argument("--size", type=int, nargs=2, default=None, metavar=("W", "H"),
+                        help="canvas in pixels, multiples of 32 (default 768 1152); training crops were up to 768x768")
+    parser.add_argument("--tag", default="", help="checkpoint suffix, e.g. _600 for the step-600 save (default: final)")
     parser.add_argument("--ema", action="store_true", help="load the *_ema generator files (run trained with --ema)")
     parser.add_argument("--holdout", type=int, default=None,
                         help="the --holdout the trainer used for that cache (default: config.json holdout, else 24)")
@@ -106,6 +111,9 @@ def main() -> None:
     parser.add_argument("--prompt-cache", type=Path, default=None,
                         help="with --run: held-out prompts from this cache (default: config.json cache[0], else train_h3's cache_iso3d)")
     args = parser.parse_args()
+    global HEIGHT, WIDTH
+    if args.size:
+        WIDTH, HEIGHT = args.size
 
     refuse_if_busy("render_dir_h3.py")
     from dir_h3 import DirHead, dir_sample, parse_layout_schedule, probe_temb_dim, use_networks
@@ -130,7 +138,7 @@ def main() -> None:
     if args.untrained:
         head = DirHead(model.video_patch_proj.out_features, probe_temb_dim(model), iters).cuda().eval()
     else:
-        head, network, adapter_state = load_run(args.run, model, config, args.rank, args.ema)
+        head, network, adapter_state = load_run(args.run, model, config, args.rank, args.ema, args.tag)
     if any(layout is not None for layout in schedule):
         adapter = make_h3_adapter()
         if adapter_state is not None:
