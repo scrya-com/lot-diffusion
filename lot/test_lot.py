@@ -790,6 +790,23 @@ def test_dir_video_modulation_rewrite():
         assert int(original[video][0]) == 3 * rows.video_timestep_index
 
 
+def test_dir_ema_warmup():
+    """EMA warm-up: early updates follow the weights; the decay ramps to its cap; the average forgets init."""
+    from train_dir_h3 import Ema
+
+    w = torch.nn.Parameter(torch.zeros(3))
+    ema = Ema([w], 0.999)
+    assert abs(ema.current_decay() - 0.1) < 1e-9          # n = 0: (1 + 0) / (10 + 0)
+    with torch.no_grad():
+        w.fill_(1.0)
+    for _ in range(600):
+        ema.update()
+    # Plain 0.999 from step 0 would still be 0.999^600 = 55% at the init value 0.
+    assert float(ema.shadow[0].min()) > 0.999, ema.shadow[0]
+    assert ema.updates == 600 and ema.current_decay() < 0.999
+    assert Ema([w], 0.999, updates=10**6).current_decay() == 0.999
+
+
 def test_dir_use_networks_restores():
     from dir_h3 import use_networks
 
@@ -843,6 +860,7 @@ def main():
         test_dir_layout_schedule,
         test_dir_video_modulation_rewrite,
         test_dir_use_networks_restores,
+        test_dir_ema_warmup,
     ]
     for test in tests:
         test()

@@ -183,7 +183,7 @@ python3 lot/render_dir_h3.py --untrained --prompts 1             # smoke: zero h
 | `--dmd-weight {norm,paper}` | `norm` | `norm`: DMD2 normaliser 1 over the mean absolute gap of x0_hat to x0_real. `paper`: w(τ) = 1, `grad = (x0_fake - x0_real)/τ`. |
 | `--betas B1 B2` | `0.9 0.999` | AdamW betas, both optimizers (paper: `0.0 0.95`). |
 | `--grad-clip` | `1.0` | Gradient-norm clip, generator and fake; `0` = off (paper: none). |
-| `--ema D` | `0` (off) | EMA of the generator's trainable params; writes `*_ema` files next to the normal ones. |
+| `--ema D` | `0` (off) | EMA of the generator's trainable params, warm-up decay `min(D, (1+n)/(10+n))` (~n/10-step window until it reaches D); writes `*_ema` files next to the normal ones. Resuming a run saved without warm-up restarts the average from the live weights. |
 
 Paper-style: `--dmd-weight paper --betas 0 0.95 --grad-clip 0 --ema 0.999 --fake-updates 4`.
 

@@ -209,16 +209,25 @@ class Run:
 
 
 class Ema:
-    """fp32 exponential moving average of the generator's trainable parameters (gen LoRA, DirHead, adapter)."""
+    """fp32 exponential moving average of the generator's trainable parameters (gen LoRA, DirHead, adapter).
 
-    def __init__(self, params, decay: float):
-        self.params, self.decay = list(params), float(decay)
+    Warm-up: update n (0-based) uses ``min(decay, (1 + n) / (10 + n))``. A plain 0.999 average started
+    at step 0 still holds 0.999^600 = 55% of the untrained weights at step 600; with the warm-up the
+    average covers roughly the last n/10 steps until n/10 reaches 1/(1 - decay) (n ~ 9000 at 0.999)."""
+
+    def __init__(self, params, decay: float, updates: int = 0):
+        self.params, self.decay, self.updates = list(params), float(decay), int(updates)
         self.shadow = [p.detach().float().clone() for p in self.params]
+
+    def current_decay(self) -> float:
+        return min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
 
     @torch.no_grad()
     def update(self) -> None:
+        decay = self.current_decay()
         for shadow, p in zip(self.shadow, self.params):
-            shadow.mul_(self.decay).add_(p.detach().float(), alpha=1.0 - self.decay)
+            shadow.mul_(decay).add_(p.detach().float(), alpha=1.0 - decay)
+        self.updates += 1
 
     @contextlib.contextmanager
     def swapped(self):
@@ -379,7 +388,8 @@ def main() -> None:
                         help="AdamW betas for both optimizers (paper: 0.0 0.95)")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clip, generator and fake (0 = off; paper: none)")
     parser.add_argument("--ema", type=float, default=0.0,
-                        help="EMA decay of the generator's trainable params (0 = off); saved as *_ema files")
+                        help="EMA decay of the generator's trainable params (0 = off), with warm-up "
+                             "min(D, (1+n)/(10+n)); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
@@ -484,14 +494,19 @@ def main() -> None:
                 adapter.load_state_dict(torch.load(args.out / f"adapter{tag}.pt", map_location=device, weights_only=True))
 
         tag = f"_{args.resume_step}"
-        if args.ema > 0 and (args.out / f"lora_gen{tag}_ema.safetensors").is_file():
+        old_cfg = args.out / "config.json"
+        warm_saved = old_cfg.is_file() and json.loads(old_cfg.read_text()).get("ema_warmup", False)
+        if args.ema > 0 and warm_saved and (args.out / f"lora_gen{tag}_ema.safetensors").is_file():
             load_gen(f"{tag}_ema")                     # seed the EMA shadow with the saved average
-            ema = Ema(gen_params, args.ema)
+            ema = Ema(gen_params, args.ema, updates=args.resume_step)
         else:
             ema = None
         load_gen(tag)
         if args.ema > 0 and ema is None:
+            # No average, or one saved without warm-up (mostly untrained weights): restart it from the live
+            # weights, with the warm-up counter at 0 so it tracks the recent steps.
             ema = Ema(gen_params, args.ema)
+            print(f"LOT_H3 kind=dir_ema_reseed step={args.resume_step} from=live", flush=True)
         info = fake_net.load_weights(str(args.out / f"lora_fake{tag}.safetensors"))
         if info.missing_keys:
             raise RuntimeError(f"resume: lora_fake{tag} is missing {len(info.missing_keys)} keys")
@@ -519,7 +534,7 @@ def main() -> None:
             "hidden": hidden, "lot": lot, "pairs": None if args.pairs is None else str(args.pairs),
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
-            "grad_clip": args.grad_clip, "ema": args.ema}
+            "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
