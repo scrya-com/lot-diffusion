@@ -826,6 +826,259 @@ def test_dir_use_networks_restores():
     assert all(m.enabled for m in gen.unet_loras + fake.unet_loras)
 
 
+# ------------------------------------------------------------------------- streaming DiR
+
+def _tiny_h3():
+    """A 2-layer, 64-wide MiniMax-H3 on the CPU in fp32 (random weights), or None without musubi."""
+    if _musubi() is None:
+        return None
+    from musubi_tuner.minimax_h3.model import MiniMaxH3Config, MiniMaxH3Model
+
+    config = MiniMaxH3Config(hidden_size=64, num_layers=2, num_attention_heads=2, attention_head_dim=32,
+                             ffn_hidden_size=128, text_dim=16, timestep_input_dim=16, time_embed_hidden_size=32,
+                             time_embed_dim=16, rope_inv_freq_len=4)
+    torch.manual_seed(0)
+    dit = MiniMaxH3Model(config, dtype=torch.float32, device="cpu")
+    with torch.no_grad():
+        for param in dit.parameters():
+            param.normal_(0.0, 0.3)       # large enough that the AdaLN gates let rows talk
+    return dit.eval()
+
+
+def _stream_head(dit, iterations=2):
+    from dir_h3 import probe_temb_dim
+    from stream_dir_h3 import StreamHead
+
+    return StreamHead(dit.config.hidden_size, probe_temb_dim(dit), iterations)
+
+
+def test_stream_layout_and_positions_match_stock():
+    if _musubi() is None:
+        print("SKIPPED test_stream_layout_and_positions_match_stock: musubi_tuner not importable", flush=True)
+        return
+    from musubi_tuner.minimax_h3.packing import build_position_grid
+    from stream_dir_h3 import MemoryEntry, memory_rows, pooled_centres, stream_layout, stream_positions
+
+    for first in (False, True):
+        layout = stream_layout(5, 7, 4, 6, first=first, memory=0)
+        assert torch.equal(stream_positions(layout), build_position_grid(layout)[0])
+    # pool 1 centres are the dense frame grid; pool 2 centres are block means
+    dense = stream_layout(5, 7, 8, 12, first=True, memory=0)
+    first_rows = dense.segment("first").row_slice
+    grid = build_position_grid(dense)[0][first_rows, 1:]
+    assert torch.equal(pooled_centres(8, 12, 1), grid)
+    assert torch.allclose(pooled_centres(8, 12, 2)[0], grid.reshape(4, 6, 2)[:2, :2].reshape(4, 2).mean(0))
+    # memory goes after the text, the window keeps every relative time and moves by the oldest age
+    entries = [MemoryEntry(torch.zeros(3, 96), torch.zeros(3, 2), time) for time in (0.0, 10.0)]
+    tokens, positions = memory_rows(entries, 30.0, "real")
+    assert tokens.shape == (6, 96) and positions[:3, 0].eq(-30.0).all() and positions[3:, 0].eq(-20.0).all()
+    layout = stream_layout(5, 7, 4, 6, first=True, memory=6)
+    assert [s.role for s in layout.segments] == ["text", "memory", "first", "target_audio", "target_video"]
+    assert layout.segments[1].start == 5 and layout.segments[1].stop == 11
+    got = stream_positions(layout, positions)
+    stock = build_position_grid(stream_layout(5, 7, 4, 6, first=True, memory=0))[0]
+    tail = slice(5 + 6, None)
+    assert torch.allclose(got[tail, 0] - 30.0, stock[5:, 0], atol=1e-9) and torch.equal(got[tail, 1:], stock[5:, 1:])
+    assert torch.equal(got[5:8, 0], torch.full((3,), 5.0, dtype=torch.float64))   # oldest memory right after text
+    _tokens, packed = memory_rows(entries, 1000.0, "packed")
+    assert packed[0, 0] < packed[3, 0] < 0 and float(packed[3, 0]) > -50                # ages capped by count
+
+
+def test_stream_frame_modulation_rewrite():
+    if _musubi() is None:
+        print("SKIPPED test_stream_frame_modulation_rewrite: musubi_tuner not importable", flush=True)
+        return
+    from musubi_tuner.minimax_h3.packing import build_timestep_rows
+    from stream_dir_h3 import frame_modulation_rewrite, stream_layout
+
+    layout = stream_layout(4, 7, 4, 6, first=True, memory=3)
+    rows = build_timestep_rows(layout, text_token_tags=torch.ones(1, 4, dtype=torch.int64), model_t_video=0.0,
+                               model_t_audio=0.0)
+    video = layout.target_video_segment.row_slice
+    frame_index = [9, 9, 7, 7, 7, 7, 8]
+    indices, segments = frame_modulation_rewrite(rows.block_adaln_indices[0], video, 6, frame_index)
+    outside = torch.ones_like(indices, dtype=torch.bool)
+    outside[video] = False
+    assert torch.equal(indices[outside], rows.block_adaln_indices[0][outside])
+    assert indices[video].tolist() == [3 * k for k in frame_index for _ in range(6)]
+    assert segments[-3:] == ((video.start, video.start + 12, 27), (video.start + 12, video.start + 36, 21),
+                             (video.start + 36, video.stop, 24))
+    # memory and first are clean conditions: their timestep differs from the target's
+    memory = layout.segment("memory").row_slice
+    assert rows.row_timesteps[0, memory].eq(0.999).all() and rows.row_timesteps[0, video].eq(0.0).all()
+
+
+def test_stream_forward_matches_stock_h3():
+    """Zero head, one shared r, no memory: the stream forward is H3's own T2VA / FL2VA-first forward."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_stream_forward_matches_stock_h3: musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import _silence, audio_frames
+    from stream_dir_h3 import stream_forward, stream_layout
+
+    head = _stream_head(dit)
+    z, text = torch.randn(1, 24, 7, 4, 6), torch.randn(1, 5, 16)
+    estimate = torch.randn_like(z)          # x0_proj is zero: the estimate cannot matter yet
+    tags = torch.ones(1, 5, dtype=torch.int64)
+    for first in (None, torch.randn(1, 24, 1, 4, 6)):
+        layout = stream_layout(5, 7, 4, 6, first=first is not None, memory=0)
+        audio = _silence(7, 1.0, "cpu", torch.Generator().manual_seed(3))
+        with torch.no_grad():
+            stock = dit(video_latents=z, audio_latents=audio, text_hidden_states=text, text_token_tags=tags,
+                        layout=layout, model_t_video=0.0, model_t_audio=0.0,
+                        visual_condition_latents=[] if first is None else [first]).video
+            for r in (0, 2):
+                got = stream_forward(dit, head, z, estimate, torch.full((7,), r), text, first=first,
+                                     audio_generator=torch.Generator().manual_seed(3))
+                assert float((got - (z + stock)).abs().max()) < 1e-5, (first is None, r)
+    assert audio.shape[-1] == audio_frames(7)
+
+
+def test_stream_per_frame_r_and_memory_reach_the_output():
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_stream_per_frame_r_and_memory_reach_the_output: musubi_tuner not importable", flush=True)
+        return
+    from stream_dir_h3 import MemoryEntry, coarse_tokens, memory_rows, pooled_centres, stream_forward
+
+    head = _stream_head(dit)
+    z, text = torch.randn(1, 24, 7, 4, 6), torch.randn(1, 5, 16)
+    r = torch.tensor([2, 2, 0, 0, 0, 0, 0])
+
+    def run(memory=None):
+        with torch.no_grad():
+            return stream_forward(dit, head, z, torch.zeros_like(z), r, text, first=torch.zeros(1, 24, 1, 4, 6),
+                                  memory=memory, audio_generator=torch.Generator().manual_seed(1))
+
+    # zero-init r rows still get separate gradients (grouping is by r, not by the delta's value)
+    head.r_embed.requires_grad_(True)
+    stream_forward(dit, head, z, torch.zeros_like(z), r, text, first=torch.zeros(1, 24, 1, 4, 6),
+                   audio_generator=torch.Generator().manual_seed(1)).square().mean().backward()
+    norms = head.r_embed.grad.norm(dim=1)
+    assert norms[0] > 0 and norms[2] > 0 and norms[1] == 0, norms
+    head.r_embed.requires_grad_(False)
+    base = run()
+    with torch.no_grad():
+        head.r_embed[1].normal_()            # no frame is at r = 1: nothing moves
+    assert torch.equal(run(), base)
+    with torch.no_grad():
+        head.r_embed[2].normal_()            # frames 0-1 are done (r = R = 2): the output moves
+    moved = run()
+    assert float((moved - base).abs().max()) > 1e-3
+    # memory rows attend into the window; coarse tokens average the patch tokens of a block
+    frame = torch.randn(1, 24, 1, 4, 6)
+    tokens = coarse_tokens(frame, 2)
+    assert tokens.shape == (2, 96)
+    assert torch.allclose(tokens[0], patchify(frame)[0, 0, :2, :2].reshape(4, 96).mean(0))
+    assert coarse_tokens(frame, 4).shape == (1, 96)                     # ceil: edge block averages its 2x3
+    assert torch.allclose(coarse_tokens(frame, 4)[0], patchify(frame)[0, 0].reshape(6, 96).mean(0))
+    memory = memory_rows([MemoryEntry(tokens, pooled_centres(4, 6, 2), -40.0)], 0.0)
+    with_memory = run(memory)
+    other = memory_rows([MemoryEntry(-tokens, pooled_centres(4, 6, 2), -40.0)], 0.0)
+    scale = float(moved.abs().max())
+    assert float((with_memory - moved).abs().max()) > 1e-4 * scale        # memory rows reach the window
+    assert float((run(other) - with_memory).abs().max()) > 1e-4 * scale   # through their content
+
+
+def test_stream_slide_is_exact_and_bounded():
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_stream_slide_is_exact_and_bounded: musubi_tuner not importable", flush=True)
+        return
+    from stream_dir_h3 import SLIDE, advance, clip_time, ready, rows_per_window, slide, start_state, stream_sample
+
+    head = _stream_head(dit, iterations=2)
+    text = torch.randn(1, 5, 16)
+    first = torch.randn(1, 24, 1, 4, 6)
+    state = start_state((7, 4, 6), 2, first=first, generator=torch.Generator().manual_seed(0), device="cpu")
+    assert state.r.tolist() == [2, 0, 0, 0, 0, 0, 0] and torch.equal(state.estimate[:, :, :1], first)
+    for _ in range(2):
+        assert not ready(state, 2)
+        advance(dit, head, state, text)
+    assert ready(state, 2) and torch.equal(state.estimate[:, :, :1], first)   # the condition never changes
+    old = state.estimate.clone()
+    old_z = state.z.clone()
+    emitted = slide(state, 2, pool=2, capacity=2, generator=torch.Generator().manual_seed(1))
+    assert torch.equal(emitted, old[:, :, :SLIDE])
+    assert torch.equal(state.estimate[:, :, :2], old[:, :, SLIDE:]) and torch.equal(state.z[:, :, :2], old_z[:, :, SLIDE:])
+    assert state.estimate[:, :, 2:].abs().max() == 0 and state.r.tolist() == [2, 2, 0, 0, 0, 0, 0]
+    assert state.has_first and abs(state.time - clip_time()) < 1e-9 and len(state.memory) == 1
+    try:
+        slide(state, 2)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("slide before the window is done")
+    # a full stream: one clip per window, bounded memory, emitted clips chain through the condition frame
+    clips = []
+    latents = stream_sample(dit, head, text, shape=(7, 4, 6), clips=4, first=first, pool=2, capacity=2,
+                            device="cpu", on_clip=lambda i, c: clips.append(c))
+    assert latents.shape == (1, 24, 20, 4, 6) and torch.equal(latents[:, :, :1], first)
+    assert torch.equal(torch.cat(clips, 2), latents)
+    with_tail = stream_sample(dit, head, text, shape=(7, 4, 6), clips=4, first=first, pool=2, capacity=2, device="cpu",
+                              tail=True)
+    assert with_tail.shape[2] == 22 and torch.equal(with_tail[:, :, :20], latents)   # 5n+2: decodes unpadded
+    assert rows_per_window((7, 4, 6), memory=2, pool=2, text_length=5) == 5 + 2 * 2 + 6 + 2 * 37 + 7 * 6
+
+
+def test_stream_head_warm_start():
+    from dir_h3 import DirHead
+    from stream_dir_h3 import StreamHead
+
+    still = DirHead(hidden=16, temb_dim=8, iterations=4)
+    with torch.no_grad():
+        for param in still.parameters():
+            param.normal_()
+    stream = StreamHead(16, 8, 4)
+    stream.load_dir_head(still.state_dict())
+    assert torch.equal(stream.r_embed[:4], still.r_embed) and stream.r_embed[4].abs().max() == 0
+    assert torch.equal(stream.x0_proj.weight, still.x0_proj.weight)
+    assert stream.mem_proj.weight.abs().max() == 0 and stream.r_embed.shape == (5, 8)
+
+
+def test_stream_trainer_updates_on_cpu():
+    """One window-0 and one rolled DMD generator update and a fake update on the toy H3: grads reach
+    only their own side, the regenerated sample matches, and done frames get no DMD signal."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_stream_trainer_updates_on_cpu: musubi_tuner not importable", flush=True)
+        return
+    import argparse
+    import random
+
+    from stream_dir_h3 import StreamFakeHead
+    from train_stream_dir_h3 import StreamRun
+
+    head = _stream_head(dit, iterations=2)
+    fake_head = StreamFakeHead(head.r_embed.shape[1], 2)
+    with torch.no_grad():
+        fake_head.fake_r_embed.normal_(0.0, 0.3)          # fake != real, so the DMD gradient is non-zero
+    args = argparse.Namespace(frames=7, rolled=0.0, pool=2, capacity=4, memory_time="real",
+                              tau_shift="beta:2.5", dmd_weight="paper")
+    run = StreamRun(dit, head, fake_head, None, None, args, "cpu")
+    still, text = torch.randn(1, 24, 1, 4, 6), torch.randn(1, 5, 16)
+    rng = random.Random(0)
+    for rolled in (False, True):
+        head.zero_grad(set_to_none=True)
+        fake_head.zero_grad(set_to_none=True)
+        loss, sample, stats = run.generator_update(still, text, rng, rolled=rolled)
+        assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5, stats
+        assert stats["active"] == (6 if not rolled else 5) and stats["rolled"] == int(rolled)
+        assert head.x0_proj.weight.grad is not None and float(head.r_embed.grad.abs().sum()) > 0
+        assert fake_head.fake_r_embed.grad is None
+        state, r_frames, x0_hat, _text = sample
+        done = r_frames >= 2
+        assert torch.equal(x0_hat[:, :, done], state.estimate[:, :, done])       # context frames untouched
+        if rolled:
+            assert len(state.memory) == 1 and head.mem_proj.weight.grad is not None
+            assert float(head.mem_proj.weight.grad.abs().sum()) > 0
+        head.zero_grad(set_to_none=True)
+        floss, _tau = run.fake_update(sample)
+        assert math.isfinite(float(floss.detach())) and float(fake_head.fake_r_embed.grad.abs().sum()) > 0
+        assert head.x0_proj.weight.grad is None
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -861,6 +1114,13 @@ def main():
         test_dir_video_modulation_rewrite,
         test_dir_use_networks_restores,
         test_dir_ema_warmup,
+        test_stream_layout_and_positions_match_stock,
+        test_stream_frame_modulation_rewrite,
+        test_stream_forward_matches_stock_h3,
+        test_stream_per_frame_r_and_memory_reach_the_output,
+        test_stream_slide_is_exact_and_bounded,
+        test_stream_head_warm_start,
+        test_stream_trainer_updates_on_cpu,
     ]
     for test in tests:
         test()

@@ -225,6 +225,28 @@ def forward_video(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
                         video_extra=video_extra, video_temb_delta=video_temb_delta)
 
 
+def run_blocks(dit, hidden: torch.Tensor, temb: torch.Tensor, block_segments, rotation) -> torch.Tensor:
+    """The DiT block stack as ``MiniMaxH3Model.forward`` runs it: block streaming, and activation
+    checkpointing in training mode. Returns the hidden states on the execution device."""
+    from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
+
+    device = dit.video_patch_proj.weight.device
+    for index, block in enumerate(dit.blocks):
+        if dit.blocks_to_swap:
+            dit.offloader.wait_for_block(index)
+        if dit.gradient_checkpointing and dit.training:
+            forward = block
+            if dit.activation_cpu_offloading:
+                forward = create_cpu_offloading_wrapper(forward, device)
+            hidden = torch.utils.checkpoint.checkpoint(forward, hidden, temb, block_segments, rotation,
+                                                       use_reentrant=False)
+        else:
+            hidden = block(hidden, temb, block_segments, rotation)
+        if dit.blocks_to_swap:
+            dit.offloader.submit_move_blocks_forward(dit.blocks, index)
+    return hidden.to(device)
+
+
 def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_audio: float, *,
                  video_extra: torch.Tensor | None = None,
                  video_temb_delta: torch.Tensor | None = None) -> torch.Tensor:
@@ -245,8 +267,6 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
         pack_video_rows,
         unpack_targets,
     )
-    from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
-
     if layout.task != "t2va":
         raise ValueError("the LoT tail is wired for T2VA layouts only")
     video_segment = layout.target_video_segment
@@ -296,20 +316,7 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
             rows.block_adaln_indices[0], lot_layout.target_video_segment.row_slice, new_index)
         video_index = new_index
 
-    for index, block in enumerate(dit.blocks):
-        if dit.blocks_to_swap:
-            dit.offloader.wait_for_block(index)
-        if dit.gradient_checkpointing and dit.training:
-            forward = block
-            if dit.activation_cpu_offloading:
-                forward = create_cpu_offloading_wrapper(forward, device)
-            hidden = torch.utils.checkpoint.checkpoint(forward, hidden, temb, block_segments, rotation,
-                                                       use_reentrant=False)
-        else:
-            hidden = block(hidden, temb, block_segments, rotation)
-        if dit.blocks_to_swap:
-            dit.offloader.submit_move_blocks_forward(dit.blocks, index)
-    hidden = hidden.to(device)
+    hidden = run_blocks(dit, hidden, temb, block_segments, rotation)
 
     # 3. Final layer: shared norm + AdaLN, then the extent heads in place of video_out.
     final = dit.final_layer

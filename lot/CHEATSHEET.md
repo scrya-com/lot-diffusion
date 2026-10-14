@@ -189,6 +189,20 @@ Paper-style: `--dmd-weight paper --betas 0 0.95 --grad-clip 0 --ema 0.999 --fake
 
 `meta.json` has DiT ms per sample and `delta[r] = mean |x̂0⁽ʳ⁾ − x̂0⁽ʳ⁻¹⁾|` per prompt.
 
+## Experimental: streaming DiR video (`stream_dir_h3.py`)
+
+One sliding window of `T = 5n+2` latent frames (default 7), refined and never re-noised. Each frame has its own noise, estimate and refinement index `r` (`R` = done). The window slides by **5 latent frames = one VAE clip (17 pixel frames)**. H3's VAE encodes every 17-frame clip on its own, so the slide is exact in latent space: the old frame 5 is a one-pixel-frame latent and becomes frame 0, which is fed as the FL2VA `first` condition (the checkpoint's own trained path). Old frame 6 is carried over done, and frames 2–6 start fresh at `r = 0`. Every clip start that leaves the window is kept as coarse memory: patch tokens average-pooled `pool × pool`, which is 36 rows per keyframe at 48×48 latent and pool 4, and at most `--capacity` keyframes. Memory rows enter as clean condition rows at their real past times.
+
+```bash
+python3 lot/test_lot.py                                           # CPU: test_stream_* (toy H3 parity with stock T2VA/FL2VA)
+python3 lot/parity_stream_h3.py                                   # GPU: parity with the still DiR step and stock FL2VA, timing
+python3 lot/train_stream_dir_h3.py --check --init lot/runs/dir_paper_run1 --init-tag _1000
+LOT_H3_TRAIN=1 python3 lot/train_stream_dir_h3.py --init lot/runs/dir_paper_run1 --init-tag _1000 --out lot/runs/stream_a
+python3 lot/render_stream_h3.py --run lot/runs/stream_a --clips 4 # or a still run: warm-started, untrained stream parts
+```
+
+Training is DMD as in `train_dir_h3.py`, on windows whose frame 0 is the cache still (I2V), or with probability `--rolled` on a self-rolled second window. The real and fake models see the same `first` condition and no memory. The memory is therefore trained only indirectly; a real model that sees longer context is still to do.
+
 ## Flags that matter
 
 | Flag | Default | What it does |
