@@ -36,6 +36,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lot_paths import LOT_H3_CHECKPOINT, LOT_H3_VAE  # noqa: E402
 
+from devices import add_device_arg, empty_cache, pick_device, swap_for, synchronize  # noqa: E402
 from gpu_guard import refuse_if_busy  # noqa: E402
 from render_h3 import load_prompts  # noqa: E402
 
@@ -78,11 +79,14 @@ def main() -> None:
     parser.add_argument("--capacity", type=int, default=16, help="memory: keyframes kept (one per clip)")
     parser.add_argument("--memory-time", choices=["real", "packed"], default="real")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--swap", type=int, default=0, help="blocks streamed from CPU (0 = all resident)")
+    parser.add_argument("--swap", type=int, default=0, help="blocks streamed from CPU (0 = all resident; CUDA only)")
+    add_device_arg(parser)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "render_stream")
     args = parser.parse_args()
 
     refuse_if_busy("render_stream_h3.py")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     from dir_h3 import probe_temb_dim, use_networks
     from h3_musubi import load_dit, load_vae, sample
     from stream_dir_h3 import StreamHead, check_window, load_stream_run, stream_sample
@@ -93,13 +97,13 @@ def main() -> None:
         raise SystemExit("--size must be multiples of 32")
     shape = (args.frames, height // 16, width // 16)
 
-    model = load_dit(LOT_H3_CHECKPOINT, swap=args.swap)
+    model = load_dit(LOT_H3_CHECKPOINT, device=device, swap=args.swap)
     temb_dim, hidden = probe_temb_dim(model), model.config.hidden_size
     network, config = None, {}
     if args.untrained:
-        head = StreamHead(hidden, temb_dim).cuda().eval()
+        head = StreamHead(hidden, temb_dim).to(device).eval()
     else:
-        head, network, config = load_stream_run(args.run, model, tag=args.tag, ema=args.ema)
+        head, network, config = load_stream_run(args.run, model, tag=args.tag, device=device, ema=args.ema)
     held = None
     if args.run is not None:
         from train_h3 import CACHE, list_items
@@ -110,21 +114,22 @@ def main() -> None:
 
     results = []
     for index, (caption, embeds) in enumerate(prompts):
-        embeds = embeds.to("cuda", torch.bfloat16)
+        embeds = embeds.to(device, torch.bfloat16)
         seed = args.seed + index
         first, first_ms = None, 0.0
         if args.first == "dense":
-            torch.cuda.synchronize()
+            synchronize(device)
             start = time.perf_counter()
             with torch.inference_mode(), use_networks(network, None, gen=False, fake=False):
-                first = sample(model, embeds, width=width, height=height, steps=args.steps, seed=seed)
-            torch.cuda.synchronize()
+                first = sample(model, embeds, width=width, height=height, steps=args.steps, seed=seed,
+                               device=device)
+            synchronize(device)
             first_ms = 1000 * (time.perf_counter() - start)
         forward_ms, clip_change = [], []
         clip_start = [time.perf_counter()]
 
         def on_clip(clip_index, clip):
-            torch.cuda.synchronize()
+            synchronize(device)
             now = time.perf_counter()
             forward_ms.append(1000 * (now - clip_start[0]))
             clip_start[0] = now
@@ -133,7 +138,7 @@ def main() -> None:
         with torch.inference_mode(), use_networks(network, None, gen=True, fake=False):
             latents = stream_sample(model, head, embeds, shape=shape, clips=args.clips, first=first, seed=seed,
                                     pool=args.pool, capacity=args.capacity, memory_time=args.memory_time,
-                                    on_clip=on_clip, tail=True)
+                                    device=device, on_clip=on_clip, tail=True)
         finite = bool(torch.isfinite(latents).all())
         results.append({"caption": caption, "latents": latents.float().cpu(), "first_ms": first_ms,
                         "clip_ms": forward_ms, "clip_abs_mean": clip_change, "finite": finite})
@@ -142,16 +147,16 @@ def main() -> None:
 
     del model, head, network
     gc.collect()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    decoder = load_vae(LOT_H3_VAE)
+    synchronize(device)
+    empty_cache(device)
+    decoder = load_vae(LOT_H3_VAE, device)
     dtype = next(decoder.parameters()).dtype
     args.out.mkdir(parents=True, exist_ok=True)
     import imageio
 
     for index, result in enumerate(results):
         with torch.inference_mode():
-            pixels = decoder.decode(result["latents"].to("cuda", dtype))
+            pixels = decoder.decode(result["latents"].to(device, dtype))
         frames = frames_of(pixels)
         imageio.mimwrite(args.out / f"p{index}.mp4", list(frames), fps=FPS, quality=8, macro_block_size=16)
         sheet(frames).save(args.out / f"p{index}_sheet.png")

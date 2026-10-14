@@ -41,6 +41,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lot_paths import LOT_H3_CHECKPOINT, LOT_H3_VAE  # noqa: E402
 
+from devices import add_device_arg, pick_device, swap_for, synchronize  # noqa: E402
 from gpu_guard import refuse_if_busy  # noqa: E402
 from render_h3 import HEIGHT as _H, WIDTH as _W, grid, load_prompts, to_image  # noqa: E402
 
@@ -54,7 +55,7 @@ def read_config(run: Path | None) -> dict:
     return json.loads(path.read_text()) if path is not None and path.is_file() else {}
 
 
-def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False, tag: str = ""):
+def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False, tag: str = "", device="cuda"):
     """``(head, gen_network, adapter_state)`` of a trained run. The one function to adapt to the trainer."""
     from safetensors import safe_open
 
@@ -76,7 +77,7 @@ def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False, 
     info = network.load_weights(str(lora_path))
     if info.missing_keys:
         raise RuntimeError(f"LoRA load missed {len(info.missing_keys)} keys")
-    network.to(device="cuda", dtype=torch.bfloat16).eval()
+    network.to(device=device, dtype=torch.bfloat16).eval()
     adapter_state = None
     if (run / f"adapter{sfx}.pt").is_file():
         adapter_state = torch.load(run / f"adapter{sfx}.pt", map_location="cpu", weights_only=True)
@@ -84,7 +85,7 @@ def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False, 
         from train_h3 import load_adapter_state
 
         adapter_state = load_adapter_state(run)
-    return head.cuda().eval(), network, adapter_state
+    return head.to(device).eval(), network, adapter_state
 
 
 def main() -> None:
@@ -99,7 +100,8 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20, help="dense baseline steps")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "render_dir")
-    parser.add_argument("--swap", type=int, default=0, help="blocks streamed from CPU (0 = all resident)")
+    parser.add_argument("--swap", type=int, default=0, help="blocks streamed from CPU (0 = all resident; CUDA only)")
+    add_device_arg(parser)
     parser.add_argument("--rank", type=int, default=None, help="gen LoRA rank if the file and config.json lack it")
     parser.add_argument("--size", type=int, nargs=2, default=None, metavar=("W", "H"),
                         help="canvas in pixels, multiples of 32 (default 768 1152); training crops were up to 768x768")
@@ -116,6 +118,8 @@ def main() -> None:
         WIDTH, HEIGHT = args.size
 
     refuse_if_busy("render_dir_h3.py")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     from dir_h3 import DirHead, dir_sample, parse_layout_schedule, probe_temb_dim, use_networks
     from h3 import make_h3_adapter
     from h3_musubi import load_dit, load_vae, sample
@@ -133,12 +137,12 @@ def main() -> None:
         print(f"WARNING: LoT schedule {spec!r} but {args.run} has no adapter.pt: the adapter is the untrained "
               f"mean lift, not what the run trained with", flush=True)
 
-    model = load_dit(LOT_H3_CHECKPOINT, swap=args.swap)
+    model = load_dit(LOT_H3_CHECKPOINT, device=device, swap=args.swap)
     network, adapter, adapter_state = None, None, None
     if args.untrained:
-        head = DirHead(model.video_patch_proj.out_features, probe_temb_dim(model), iters).cuda().eval()
+        head = DirHead(model.video_patch_proj.out_features, probe_temb_dim(model), iters).to(device).eval()
     else:
-        head, network, adapter_state = load_run(args.run, model, config, args.rank, args.ema, args.tag)
+        head, network, adapter_state = load_run(args.run, model, config, args.rank, args.ema, args.tag, device)
     if any(layout is not None for layout in schedule):
         adapter = make_h3_adapter()
         if adapter_state is not None:
@@ -147,7 +151,7 @@ def main() -> None:
             from procrustes_h3 import CHECKPOINT, pretrained_maps
 
             adapter.init_from_pretrained(*pretrained_maps(CHECKPOINT))   # untrained: mean lift
-        adapter = adapter.cuda().eval()
+        adapter = adapter.to(device).eval()
 
     held = None
     if args.run is not None:
@@ -163,21 +167,22 @@ def main() -> None:
     latents: dict[tuple[int, str], torch.Tensor] = {}
     dense_ms, dir_ms, deltas = [], [], []
     for index, (_text, embeds) in enumerate(prompts):
-        embeds = embeds.to("cuda", torch.bfloat16)
+        embeds = embeds.to(device, torch.bfloat16)
         seed = args.seed + index
-        torch.cuda.synchronize()
+        synchronize(device)
         start = time.perf_counter()
         with torch.inference_mode(), use_networks(network, None, gen=False, fake=False):
-            dense = sample(model, embeds, width=WIDTH, height=HEIGHT, steps=args.steps, seed=seed)
-        torch.cuda.synchronize()
+            dense = sample(model, embeds, width=WIDTH, height=HEIGHT, steps=args.steps, seed=seed,
+                           device=device)
+        synchronize(device)
         dense_ms.append(1000 * (time.perf_counter() - start))
         latents[(index, "dense20")] = dense.float().cpu()
 
         start = time.perf_counter()
         with torch.inference_mode(), use_networks(network, None, gen=True, fake=False):
             _final, estimates = dir_sample(model, head, embeds, height=HEIGHT, width=WIDTH, iters=iters,
-                                           seed=seed, schedule=schedule, adapter=adapter)
-        torch.cuda.synchronize()
+                                           seed=seed, schedule=schedule, adapter=adapter, device=device)
+        synchronize(device)
         dir_ms.append(1000 * (time.perf_counter() - start))
         previous = torch.zeros_like(estimates[0])
         row = []
@@ -191,8 +196,8 @@ def main() -> None:
               f"finite={int(all(bool(torch.isfinite(estimate).all()) for estimate in estimates))}", flush=True)
     del model, head, network, adapter
     gc.collect()
-    torch.cuda.synchronize()
-    decoder = load_vae(LOT_H3_VAE)
+    synchronize(device)
+    decoder = load_vae(LOT_H3_VAE, device)
 
     args.out.mkdir(parents=True, exist_ok=True)
     names = ["dense20"] + [f"dir{r}" for r in range(1, iters + 1)]
@@ -201,7 +206,7 @@ def main() -> None:
         row = []
         for name in names:
             with torch.inference_mode():
-                image = to_image(decoder.decode(latents[(index, name)].to("cuda", next(decoder.parameters()).dtype)))
+                image = to_image(decoder.decode(latents[(index, name)].to(device, next(decoder.parameters()).dtype)))
             image.save(args.out / f"p{index}_{name}.png")
             row.append(image)
         rows.append(row)

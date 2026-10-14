@@ -27,6 +27,7 @@ from dataclasses import replace
 
 import torch
 
+from devices import narrow_positions, rotary_positions
 from lot_paths import LOT_H3_CHECKPOINT, MUSUBI_SRC
 
 if MUSUBI_SRC not in sys.path:
@@ -92,18 +93,30 @@ def audio_frames(latent_t: int) -> int:
 
 # ------------------------------------------------------------------------------ loading
 
-def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, train: bool = False):
+def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, train: bool = False,
+             dequant_bf16: bool | None = None):
     """The H3 transformer, frozen, ready for ``predict``.
 
-    ``swap`` blocks stream from CPU (H2D only: the base is frozen). ``train``
-    turns on activation checkpointing and lets the swap run a backward pass.
+    ``swap`` blocks stream from CPU (H2D only: the base is frozen; CUDA only, see
+    ``devices.swap_for``). ``train`` turns on activation checkpointing and lets the swap
+    run a backward pass. ``dequant_bf16`` (default: on everywhere but CUDA) loads on the
+    CPU and turns the ConvRot int8 linears into bf16 ones (``dequantize_int8_linears``):
+    twice the weight memory, no int8 kernels needed.
     """
     from musubi_tuner.minimax_h3.model import load_h3_transformer
     from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 
     device = torch.device(device)
-    dit = load_h3_transformer(str(checkpoint), device="cpu" if swap else device)
+    if dequant_bf16 is None:
+        dequant_bf16 = device.type != "cuda"
+    dit = load_h3_transformer(str(checkpoint), device="cpu" if swap or dequant_bf16 else device)
     dit.requires_grad_(False)
+    if dequant_bf16:
+        dequantize_int8_linears(dit)
+        if not swap:
+            dit.to(device)
+    if device.type == "mps":
+        host_position_grids()
     if swap:
         dit.enable_block_swap(swap, BlockSwapConfig(device=device, supports_backward=train, h2d_only=True))
         dit.move_to_device_except_swap_blocks(device)
@@ -112,6 +125,45 @@ def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, trai
         dit.enable_gradient_checkpointing()
         dit.train()
     return dit
+
+
+def host_position_grids() -> None:
+    """MPS has no float64: make the stock forward's rotary grid (``build_position_grid`` as
+    ``MiniMaxH3Model._cached_rotation_table`` calls it) narrow to float32 on the CPU before an
+    MPS move (``devices.narrow_positions``). Other devices get exactly the stock call. Idempotent;
+    leaves musubi's files alone. ``load_dit`` installs it for MPS."""
+    import musubi_tuner.minimax_h3.model as model
+
+    stock = model.build_position_grid
+    if getattr(stock, "host_narrowed", False):
+        return
+
+    def build_position_grid(layout, *, device=None):
+        if device is not None and narrow_positions(device):
+            return rotary_positions(stock(layout), device)
+        return stock(layout, device=device)
+
+    build_position_grid.host_narrowed = True
+    model.build_position_grid = build_position_grid
+
+
+def dequantize_int8_linears(dit, dtype: torch.dtype = torch.bfloat16) -> int:
+    """Turn every ConvRot int8 linear of ``dit`` back into a plain ``nn.Linear`` holding the dequantized
+    weight (rotated back to the original basis) in ``dtype``. Same module, name and class, so ``make_lora``
+    still wraps it; call it before ``make_lora`` (LoRA keeps the forward it finds). Returns the count."""
+    from musubi_tuner.modules.convrot_int8_kernels import dequantize_int8_convrot_weight
+
+    count = 0
+    for module in dit.modules():
+        if not (isinstance(module, torch.nn.Linear) and hasattr(module, "_convrot_groupsize")):
+            continue
+        weight = dequantize_int8_convrot_weight(module.weight.data, module.scale_weight, module._convrot_groupsize)
+        module.weight = torch.nn.Parameter(weight.to(dtype), requires_grad=False)
+        del module.scale_weight                          # buffer
+        del module.forward, module._convrot_groupsize, module._convrot_bwd_mode   # back to nn.Linear.forward
+        count += 1
+    dit.is_convrot_int8 = False
+    return count
 
 
 def make_lora(dit, rank: int):
@@ -303,7 +355,7 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
     positions = build_position_grid(layout)[0]
     if lot is not None:
         positions = lot.replace_video_positions(positions, latent_t, lat_h, lat_w)
-    rotation = dit._rotation_table(positions.unsqueeze(0).to(device), hidden.dtype)
+    rotation = dit._rotation_table(rotary_positions(positions.unsqueeze(0), device), hidden.dtype)
     rows = build_timestep_rows(lot_layout, text_token_tags=tags, model_t_video=t_video, model_t_audio=t_audio)
     temb = dit._timestep_embeddings(rows.unique_timesteps, device)
     block_segments = rows.block_segments

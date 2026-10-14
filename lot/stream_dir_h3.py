@@ -44,6 +44,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from devices import rotary_positions
 from dir_h3 import DEFAULT_R, TOKEN_DIM, DirHead
 from h3 import patchify
 
@@ -336,7 +337,7 @@ def window_forward(dit, latent: torch.Tensor, t: float, text: torch.Tensor, *, f
         raise RuntimeError(f"packed {hidden.shape[1]} rows for a {layout.row_count}-row layout")
 
     positions = stream_positions(layout, None if memory is None else memory[1])
-    rotation = dit._rotation_table(positions.unsqueeze(0).to(device), hidden.dtype)
+    rotation = dit._rotation_table(rotary_positions(positions.unsqueeze(0), device), hidden.dtype)
     tags = torch.ones(1, text.shape[1], dtype=torch.int64)
     rows = packing.build_timestep_rows(layout, text_token_tags=tags, model_t_video=t_video, model_t_audio=1.0 - sigma_a)
     temb = dit._timestep_embeddings(rows.unique_timesteps, device)

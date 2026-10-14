@@ -1079,6 +1079,117 @@ def test_stream_trainer_updates_on_cpu():
         assert head.x0_proj.weight.grad is None
 
 
+# --------------------------------------------------------------------------- devices (MPS port)
+
+def test_device_helpers_on_cpu():
+    import devices
+
+    cpu = devices.pick_device("cpu")
+    assert cpu.type == "cpu" and devices.peak_mb(cpu) == 0.0 and devices.allocated_mb(cpu) == 0.0
+    devices.synchronize(cpu)
+    devices.reset_peak(cpu)
+    devices.empty_cache(cpu)
+    assert devices.swap_for("cuda", 4) == 4 and devices.swap_for("mps", 4) == 0 and devices.swap_for("cpu", 0) == 0
+    if not torch.cuda.is_available():
+        assert devices.pick_device("auto").type == ("mps" if devices.mps_available() else "cpu")
+    grid = torch.arange(6, dtype=torch.float64).reshape(1, 2, 3) / 3.0
+    assert devices.rotary_positions(grid, "cpu").dtype == torch.float64       # CUDA / CPU: moved as is
+    assert not devices.narrow_positions("cuda") and devices.narrow_positions("mps")
+    devices.FLOAT32_POSITIONS = True
+    try:
+        narrowed = devices.rotary_positions(grid, "cpu")
+    finally:
+        devices.FLOAT32_POSITIONS = None
+    assert narrowed.dtype == torch.float32 and torch.equal(narrowed, grid.to(torch.float32))
+
+
+def test_float32_positions_leave_the_forward_unchanged():
+    """The MPS path (float32 rotary positions narrowed on the host) gives the same stream and stock forwards."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_float32_positions_leave_the_forward_unchanged: musubi_tuner not importable", flush=True)
+        return
+    import devices
+    import musubi_tuner.minimax_h3.model as model
+    from h3_musubi import _silence, host_position_grids
+    from stream_dir_h3 import stream_forward, stream_layout
+
+    head = _stream_head(dit)
+    z, text, first = torch.randn(1, 24, 7, 4, 6), torch.randn(1, 5, 16), torch.randn(1, 24, 1, 4, 6)
+    layout = stream_layout(5, 7, 4, 6, first=True, memory=0)
+    r = torch.tensor([2, 0, 1, 0, 1, 0, 0])
+
+    def run():
+        dit._rotary_cache.clear()
+        with torch.no_grad():
+            stream = stream_forward(dit, head, z, torch.randn_like(z), r, text, first=first,
+                                    audio_generator=torch.Generator().manual_seed(3))
+            stock = dit(video_latents=z, audio_latents=_silence(7, 1.0, "cpu", torch.Generator().manual_seed(3)),
+                        text_hidden_states=text, text_token_tags=torch.ones(1, 5, dtype=torch.int64), layout=layout,
+                        model_t_video=0.0, model_t_audio=0.0, visual_condition_latents=[first]).video
+        return stream, stock
+
+    torch.manual_seed(1)
+    want = run()
+    stock_grid = model.build_position_grid
+    host_position_grids()
+    devices.FLOAT32_POSITIONS = True
+    try:
+        assert model.build_position_grid(layout, device="cpu").dtype == torch.float32
+        torch.manual_seed(1)
+        got = run()
+    finally:
+        devices.FLOAT32_POSITIONS = None
+        model.build_position_grid = stock_grid
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+
+def test_dequantize_int8_linears_keeps_outputs_and_lora():
+    """int8 ConvRot linears (eager path) -> plain linears: same forward, same LoRA targets."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_dequantize_int8_linears_keeps_outputs_and_lora: musubi_tuner not importable", flush=True)
+        return
+    from musubi_tuner.minimax_h3.model import H3_CONVROT_INT8_TARGET_KEYS
+    from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
+    from musubi_tuner.modules.convrot_int8_utils import apply_convrot_int8_monkey_patch
+    from h3_musubi import dequantize_int8_linears, make_lora, set_lora
+    from stream_dir_h3 import stream_forward
+
+    state = {}
+    for name, module in dit.named_modules():
+        if isinstance(module, torch.nn.Linear) and name.startswith("blocks.") and \
+                any(name.endswith(key) for key in H3_CONVROT_INT8_TARGET_KEYS) and module.in_features % 64 == 0:
+            state[name + ".weight"], state[name + ".scale_weight"] = quantize_int8_convrot_weight(module.weight.data, 64)
+    apply_convrot_int8_monkey_patch(dit, state, groupsize=64)
+    with torch.no_grad():
+        for name, module in dit.named_modules():
+            if name + ".weight" in state:
+                module.weight = torch.nn.Parameter(state[name + ".weight"], requires_grad=False)
+                module.scale_weight.copy_(state[name + ".scale_weight"])
+    head = _stream_head(dit)
+    z, text = torch.randn(1, 24, 7, 4, 6), torch.randn(1, 5, 16)
+
+    def run():
+        with torch.no_grad():
+            return stream_forward(dit, head, z, torch.zeros_like(z), torch.zeros(7, dtype=torch.int64), text,
+                                  audio_generator=torch.Generator().manual_seed(3))
+
+    int8 = run()
+    count = dequantize_int8_linears(dit, dtype=torch.float32)
+    assert count == len(state) // 2 >= 4 * len(dit.blocks)
+    plain = [m for n, m in dit.named_modules() if n + ".weight" in state]
+    assert all(type(m) is torch.nn.Linear and m.weight.dtype == torch.float32 and "forward" not in vars(m)
+               and not hasattr(m, "scale_weight") for m in plain)
+    dense = run()
+    assert float((dense - int8).abs().max()) < 1e-3 * float(int8.abs().max()), float((dense - int8).abs().max())
+    network = make_lora(dit, 4)                       # wraps the dequantized linears (4 per block)
+    assert all(lora.org_forward.__self__ in plain and lora.org_forward.__func__ is torch.nn.Linear.forward
+               for lora in network.unet_loras)
+    set_lora(network, True)
+    assert torch.equal(run(), dense)                  # zero-up LoRA: the dequantized base unchanged
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -1121,6 +1232,9 @@ def main():
         test_stream_slide_is_exact_and_bounded,
         test_stream_head_warm_start,
         test_stream_trainer_updates_on_cpu,
+        test_device_helpers_on_cpu,
+        test_float32_positions_leave_the_forward_unchanged,
+        test_dequantize_int8_linears_keeps_outputs_and_lora,
     ]
     for test in tests:
         test()

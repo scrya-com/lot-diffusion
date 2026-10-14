@@ -51,6 +51,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from devices import add_device_arg, allocated_mb, peak_mb, pick_device, reset_peak, swap_for, synchronize  # noqa: E402
 from lot_paths import LOT_H3_STILLS_CACHE  # noqa: E402
 
 import train_h3  # noqa: E402
@@ -189,29 +190,29 @@ def check(run: StreamRun, groups: dict, items, rng, device) -> None:
     for rolled in (False, True):
         all_params = [p for g in groups.values() for p in g]
         zero_grads(all_params)
-        torch.cuda.reset_peak_memory_stats()
+        reset_peak(device)
         start = time.perf_counter()
         loss, sample, stats = run.generator_update(still, text, rng, rolled=rolled)
-        torch.cuda.synchronize()
+        synchronize(device)
         sums = {k: grad_sum(v) for k, v in groups.items()}
         ok = (sums["gen_lora"] > 0 and sums["stream_head"] > 0 and sums["fake_lora"] == 0 and sums["fake_head"] == 0
               and math.isfinite(stats["loss"]))
         print(f"LOT_H3 kind=stream_check_gen rolled={int(rolled)} r={stats['r']} active={stats['active']} "
               f"loss={stats['loss']:.4g} regen_maxdiff={stats['match']:.3g} "
               + " ".join(f"grad_{k}={v:.3g}" for k, v in sums.items())
-              + f" seconds={time.perf_counter() - start:.1f} peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f} "
+              + f" seconds={time.perf_counter() - start:.1f} peak_mb={peak_mb(device):.0f} "
               f"ok={int(ok)}", flush=True)
         zero_grads(all_params)
-        torch.cuda.reset_peak_memory_stats()
+        reset_peak(device)
         start = time.perf_counter()
         floss, _tau = run.fake_update(sample)
-        torch.cuda.synchronize()
+        synchronize(device)
         sums = {k: grad_sum(v) for k, v in groups.items()}
         ok = (sums["fake_lora"] > 0 and sums["fake_head"] > 0 and sums["gen_lora"] == 0 and sums["stream_head"] == 0
               and math.isfinite(float(floss.detach())))
         print(f"LOT_H3 kind=stream_check_fake rolled={int(rolled)} loss={float(floss.detach()):.4g} "
               + " ".join(f"grad_{k}={v:.3g}" for k, v in sums.items())
-              + f" seconds={time.perf_counter() - start:.1f} peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f} "
+              + f" seconds={time.perf_counter() - start:.1f} peak_mb={peak_mb(device):.0f} "
               f"ok={int(ok)}", flush=True)
         zero_grads(all_params)
 
@@ -241,7 +242,8 @@ def main() -> None:
     parser.add_argument("--grad-clip", type=float, default=0.0)
     parser.add_argument("--ema", type=float, default=0.999)
     parser.add_argument("--rank", type=int, default=16, help="LoRA rank without --init (else the init run's)")
-    parser.add_argument("--swap", type=int, default=4)
+    parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU (CUDA only)")
+    add_device_arg(parser)
     parser.add_argument("--holdout", type=int, default=8)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
@@ -258,7 +260,8 @@ def main() -> None:
     refuse_if_busy("train_stream_dir_h3.py")
     from h3_musubi import load_dit, make_lora
 
-    device = torch.device("cuda")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     train_items, held_items = [], []
@@ -297,9 +300,10 @@ def main() -> None:
 
     gen_lora_groups, _ = gen_net.prepare_optimizer_params(args.lr)
     fake_lora_groups, _ = fake_net.prepare_optimizer_params(args.fake_lr)
-    gen_opt, opt_name = make_optimizer(gen_lora_groups + [{"params": list(head.parameters()), "lr": args.lr}], args.betas)
+    gen_opt, opt_name = make_optimizer(gen_lora_groups + [{"params": list(head.parameters()), "lr": args.lr}], args.betas,
+                                       device)
     fake_opt, _ = make_optimizer(fake_lora_groups + [{"params": list(fake_head.parameters()), "lr": args.fake_lr}],
-                                 args.betas)
+                                 args.betas, device)
     groups = {"gen_lora": [p for g in gen_lora_groups for p in g["params"]], "stream_head": list(head.parameters()),
               "fake_lora": [p for g in fake_lora_groups for p in g["params"]], "fake_head": list(fake_head.parameters())}
     gen_params = groups["gen_lora"] + groups["stream_head"]
@@ -308,7 +312,7 @@ def main() -> None:
     print(f"LOT_H3 kind=stream_start items={len(train_items)} holdout={len(held_items)} frames={args.frames} "
           f"iterations={args.iterations} rolled={args.rolled} crop={args.max_latent_hw} optimizer={opt_name} "
           f"gen_trainable={sum(p.numel() for p in gen_params)} swap={args.swap} "
-          f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
+          f"allocated_mb={allocated_mb(device):.0f}", flush=True)
 
     run = StreamRun(dit, head, fake_head, gen_net, fake_net, args, device)
     if args.check:
@@ -384,7 +388,7 @@ def main() -> None:
             print(f"LOT_H3 kind=stream step={step} loss={stats['loss']:.4g} fake_loss={record['fake_loss']:.4f} "
                   f"fake_real={stats['fake_real']:.4f} hat_real={stats['hat_real']:.4f} grad_norm={grad_norm:.3g} "
                   f"s_per_step={(time.perf_counter() - started) / step:.1f} "
-                  f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
+                  f"peak_mb={peak_mb(device):.0f}", flush=True)
         if args.save_every and step % args.save_every == 0:
             save(f"_{step}")
     save("")

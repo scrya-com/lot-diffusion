@@ -34,6 +34,7 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lot_paths import LOT_H3_CHECKPOINT, LOT_H3_STILLS_CACHE, LOT_H3_STILLS_CAPTIONS, LOT_H3_TEXT_ENCODER, LOT_H3_VAE  # noqa: E402,F401
 
+from devices import add_device_arg, pick_device, swap_for, synchronize  # noqa: E402
 from gpu_guard import refuse_if_busy  # noqa: E402
 from h3 import clip_layout, make_h3_adapter  # noqa: E402
 from layout import TokenRect, layout_from_rects  # noqa: E402
@@ -106,7 +107,8 @@ def main() -> None:
     parser.add_argument("--layout", choices=("bands", "uniform2", "uniform4"), default="bands",
                         help="bands: 1x1/2x2/4x2 thirds; uniformN: every token NxN")
     parser.add_argument("--variants", default="dense,lot_mean,lot_fit")
-    parser.add_argument("--swap", type=int, default=SWAP, help="blocks streamed from CPU (0 = all resident)")
+    parser.add_argument("--swap", type=int, default=SWAP, help="blocks streamed from CPU (0 = all resident; CUDA only)")
+    add_device_arg(parser)
     parser.add_argument("--trained", type=Path, default=None,
                         help="train_h3 output dir (adapter.pt, lora.safetensors): enables the dense_lora and "
                              "lot_trained variants and renders the trainer's held-out prompts")
@@ -118,6 +120,8 @@ def main() -> None:
     args = parser.parse_args()
 
     refuse_if_busy("render_h3.py")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     from h3_musubi import load_dit, load_vae, make_lora, sample, set_lora
 
     # Build only what the requested variants use: each fp32 adapter is ~200 MB, and with
@@ -129,16 +133,16 @@ def main() -> None:
     if "lot_mean" in wanted:
         mean = make_h3_adapter()
         mean.init_from_pretrained(*pretrained_maps(CHECKPOINT))
-        splices["lot_mean"] = LotSplice(mean.cuda(), layout)
+        splices["lot_mean"] = LotSplice(mean.to(device), layout)
     if "lot_fit" in wanted:
         fitted = make_h3_adapter()
         fitted.init_from_pretrained(*pretrained_maps(CHECKPOINT))
         if args.pairs is None:
             raise SystemExit("the lot_fit variant needs --pairs")
         reports = fit_bank(fitted, load_pairs(args.pairs))
-        splices["lot_fit"] = LotSplice(fitted.cuda(), layout, y_space=True)
+        splices["lot_fit"] = LotSplice(fitted.to(device), layout, y_space=True)
 
-    model = load_dit(CHECKPOINT, swap=args.swap)
+    model = load_dit(CHECKPOINT, device=device, swap=args.swap)
     network = None
     if args.trained is not None:
         trained = make_h3_adapter()
@@ -146,12 +150,12 @@ def main() -> None:
 
         trained.load_state_dict(load_adapter_state(args.trained))
         if "lot_trained" in wanted:
-            splices["lot_trained"] = LotSplice(trained.cuda(), layout, y_space=True)
+            splices["lot_trained"] = LotSplice(trained.to(device), layout, y_space=True)
         network = make_lora(model, args.rank)
         info = network.load_weights(str(args.trained / "lora.safetensors"))
         if info.missing_keys:
             raise RuntimeError(f"LoRA load missed {len(info.missing_keys)} keys")
-        network.to(device="cuda", dtype=torch.bfloat16).eval()
+        network.to(device=device, dtype=torch.bfloat16).eval()
 
     held = None
     if args.trained is not None:
@@ -166,15 +170,15 @@ def main() -> None:
     timings: dict[str, list[float]] = {name: [] for name in variants}
     seq = {"dense": layout.dense_count, "lot": layout.count}
     for index, (_text, embeds) in enumerate(prompts):
-        embeds = embeds.to("cuda", torch.bfloat16)
+        embeds = embeds.to(device, torch.bfloat16)
         for name in variants:
             if network is not None:
                 set_lora(network, name in ("dense_lora", "lot_trained"))
             start = time.perf_counter()
             with torch.inference_mode():
                 latent = sample(model, embeds, width=WIDTH, height=HEIGHT, steps=args.steps,
-                                seed=args.seed + index, lot=splices.get(name))
-            torch.cuda.synchronize()
+                                seed=args.seed + index, lot=splices.get(name), device=device)
+            synchronize(device)
             timings[name].append(time.perf_counter() - start)
             if name in ("lot_fit", "lot_trained"):
                 latent = splices[name].to_x(latent.float())
@@ -183,8 +187,8 @@ def main() -> None:
                   f"finite={int(bool(torch.isfinite(latent).all()))}", flush=True)
     del model, splices, network
     gc.collect()
-    torch.cuda.synchronize()
-    decoder = load_vae(VAE)
+    synchronize(device)
+    decoder = load_vae(VAE, device)
 
     args.out.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -192,7 +196,7 @@ def main() -> None:
         row = []
         for name in variants:
             with torch.inference_mode():
-                image = to_image(decoder.decode(latents[(index, name)].to("cuda", next(decoder.parameters()).dtype)))
+                image = to_image(decoder.decode(latents[(index, name)].to(device, next(decoder.parameters()).dtype)))
             image.save(args.out / f"p{index}_{name}.png")
             row.append(image)
         rows.append(row)

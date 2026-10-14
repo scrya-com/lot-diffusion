@@ -203,6 +203,25 @@ python3 lot/render_stream_h3.py --run lot/runs/stream_a --clips 4 # or a still r
 
 Training is DMD as in `train_dir_h3.py`, on windows whose frame 0 is the cache still (I2V), or with probability `--rolled` on a self-rolled second window. The real and fake models see the same `first` condition and no memory. The memory is therefore trained only indirectly; a real model that sees longer context is still to do.
 
+## Mac (Apple Silicon): untested on real hardware
+
+The DiR, streaming DiR and LoT H3 scripts take `--device {auto,cuda,mps,cpu}` (`auto`: cuda, else mps, else cpu); so do the two parity scripts. **No run has been made on a Mac.** The MPS path was checked only on Linux: the CPU tests, and the bf16-dequantized base on CUDA (`parity_dir_h3.py --dequant` → `ok=1`). CUDA runs are unchanged: same parity numbers before and after the port.
+
+- **Needs** macOS 14+ and a PyTorch build with MPS (`torch.backends.mps.is_available()`). Export `PYTORCH_ENABLE_MPS_FALLBACK=1` so ops MPS lacks fall back to the CPU.
+- **What changes off CUDA.** The int8 ConvRot base is dequantized to bf16 at load (`load_dit(dequant_bf16=...)`, on by default when the device is not CUDA). That doubles the weights to ~42 GB; this box measured a 41 GB peak RSS. Outputs differ from the CUDA int8 kernels by 2–6 % rel. RMS, because those kernels also quantize activations. `--swap` is forced to 0, since block swap needs CUDA streams; memory is unified anyway. bitsandbytes AdamW8bit becomes torch AdamW. Rotary positions are narrowed to float32 on the CPU (MPS has no float64), which gives the same table. `peak_mb` reports the MPS driver's current allocation, because MPS has no peak counter.
+- **Memory** (unified): ~64 GB minimum for stills, 96–128 GB comfortable, 128 GB+ for stream windows and stream training. Let the GPU wire more of it, e.g. `sudo sysctl iogpu.wired_limit_mb=110000` on a 128 GB machine; the setting resets on reboot.
+- **Speed:** expect roughly 8–15× slower than the 24 GB CUDA card. That is an estimate, not a measurement. Attention is torch SDPA (`attn_mode="torch"`). Long video sequences may hit MPS SDPA memory limits.
+
+```bash
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+python3 lot/test_lot.py                                            # CPU, ok 43
+python3 lot/parity_dir_h3.py --device mps                          # -> ok=1
+python3 lot/parity_stream_h3.py --device mps --time-size 32 32
+python3 lot/render_dir_h3.py --device mps --run lot/runs/dir_a --prompts 1
+python3 lot/render_stream_h3.py --device mps --run lot/runs/dir_paper_run1 --tag _1000 --clips 2 --size 512 512
+python3 lot/train_dir_h3.py --device mps --check --max-latent-hw 32 32
+```
+
 ## Flags that matter
 
 | Flag | Default | What it does |

@@ -68,6 +68,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from devices import add_device_arg, allocated_mb, peak_mb, pick_device, reset_peak, swap_for, synchronize  # noqa: E402
 from lot_paths import LOT_H3_CHECKPOINT, LOT_H3_STILLS_CACHE, LOT_H3_STILLS_CAPTIONS, LOT_H3_TEXT_ENCODER, LOT_H3_VAE  # noqa: E402,F401
 
 from flow import lot_h3_clean_loss, sample_noisy  # noqa: E402
@@ -328,7 +329,7 @@ def check(adapter, dit, network, groups, items, rng, device, args) -> None:
         y0 = splice.to_y(x0)
         sigma = sample_sigma(args.dense_shift if kind == "dense" else args.shift, device)
         y_t, _ = sample_noisy(y0, sigma)
-        torch.cuda.reset_peak_memory_stats()
+        reset_peak(device)
         start = time.perf_counter()
         out = predict(dit, y_t, 1.0 - sigma, text, lot=splice)
         loss = lot_h3_clean_loss(out, y_t, y0, sigma)
@@ -343,7 +344,7 @@ def check(adapter, dit, network, groups, items, rng, device, args) -> None:
             student = splice.to_x(y_t.float() + sigma.reshape(1, 1, 1, 1, 1) * out.float())
             loss = loss + args.distill * (student - target).square().mean() / float(sigma.clamp(min=0.05)) ** 2
         loss.backward()
-        torch.cuda.synchronize()
+        synchronize(device)
         lora_grad = sum(float(p.grad.abs().sum()) for p in groups[0]["params"] if p.grad is not None)
         adapter_grad = sum(float(p.grad.abs().sum()) for p in groups[-1]["params"] if p.grad is not None)
         for p in params:
@@ -351,7 +352,7 @@ def check(adapter, dit, network, groups, items, rng, device, args) -> None:
         print(f"LOT_H3 kind=train_check layout={kind} tokens={layout.count}/{layout.dense_count} "
               f"loss={float(loss.detach()):.4f} sigma={float(sigma):.3f} lora_grad={lora_grad:.3g} "
               f"adapter_grad={adapter_grad:.3g} seconds={time.perf_counter() - start:.2f} "
-              f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f} ok={int(math.isfinite(float(loss.detach())))}",
+              f"peak_mb={peak_mb(device):.0f} ok={int(math.isfinite(float(loss.detach())))}",
               flush=True)
 
 
@@ -376,7 +377,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--adapter-lr", type=float, default=1e-4)
     parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
+    parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU (CUDA only); >0 turns on checkpointing")
+    add_device_arg(parser)
     parser.add_argument("--dense-p", type=float, default=0.2)
     parser.add_argument("--layout-mix", type=parse_mix, default=None,
                         help="weights of non-dense layout families, e.g. box:0.3,focus:0.3,texture:0.2,mosaic:0.1,"
@@ -401,7 +403,8 @@ def main() -> None:
     from h3_musubi import load_dit, make_lora
     from procrustes_h3 import CHECKPOINT, fit_bank, load_pairs, pretrained_maps
 
-    device = torch.device("cuda")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     caches = args.cache or [CACHE]
@@ -432,19 +435,21 @@ def main() -> None:
     lora_groups, _ = network.prepare_optimizer_params(args.lr)
     adapter_params = [p for name, p in adapter.named_parameters() if not name.startswith("bank.")]
     groups = lora_groups + [{"params": adapter_params, "lr": args.adapter_lr}]
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(groups, weight_decay=0.0)
-        opt_name = "adamw8bit"
-    except ImportError:
+    optimizer, opt_name = None, "adamw"
+    if device.type == "cuda":                    # bitsandbytes' 8-bit AdamW is CUDA only
+        try:
+            import bitsandbytes as bnb
+            optimizer, opt_name = bnb.optim.AdamW8bit(groups, weight_decay=0.0), "adamw8bit"
+        except ImportError:
+            pass
+    if optimizer is None:
         optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
-        opt_name = "adamw"
     trainable = sum(p.numel() for g in groups for p in g["params"])
     print(f"LOT_H3 kind=train_start items={len(train_items)} holdout={len(held_items)} "
           f"lora_modules={len(network.unet_loras)} trainable={trainable} optimizer={opt_name} "
           f"swap={args.swap} shift={args.shift} dense_shift={args.dense_shift} caches={len(caches)} "
           f"distill={args.distill} data_weight={args.data_weight} "
-          f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
+          f"allocated_mb={allocated_mb(device):.0f}", flush=True)
 
     if args.check:
         check(adapter, dit, network, groups, train_items, rng, device, args)
@@ -561,7 +566,7 @@ def main() -> None:
             print(f"LOT_H3 kind=train step={step} loss={record['loss']:.4f}{gap_text} sigma={record['sigma']:.3f} "
                   f"layout={kind} tokens={layout.count}/{layout.dense_count} "
                   f"s_per_step={(time.perf_counter() - started) / step:.2f} "
-                  f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
+                  f"peak_mb={peak_mb(device):.0f}", flush=True)
         if args.eval_every and step % args.eval_every == 0:
             evaluate(step)
         if args.save_every and step % args.save_every == 0:

@@ -66,6 +66,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from devices import add_device_arg, allocated_mb, peak_mb, pick_device, reset_peak, swap_for, synchronize  # noqa: E402
 from lot_paths import LOT_H3_STILLS_CACHE  # noqa: E402
 
 import train_h3  # noqa: E402
@@ -304,13 +305,13 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
         seen.add(name)
         all_params = [p for g in groups.values() for p in g]
         zero_grads(all_params)
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
+        reset_peak(device)
+        synchronize(device)
         start = time.perf_counter()
         loss, x0_hat, stats = run.generator_update(z, text, r)
-        torch.cuda.synchronize()
+        synchronize(device)
         gen_seconds = time.perf_counter() - start
-        gen_peak = torch.cuda.max_memory_allocated() / 2**20
+        gen_peak = peak_mb(device)
         sums = {k: grad_sum(v) for k, v in groups.items()}
         gen_ok = (sums["gen_lora"] > 0 and sums["dir_head"] > 0 and sums["fake_lora"] == 0 and sums["fake_head"] == 0
                   and (sums["adapter"] > 0 or not run.args.train_adapter or layout is None)
@@ -322,10 +323,10 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
               f"grad_fake_head={sums['fake_head']:.3g} seconds={gen_seconds:.2f} peak_mb={gen_peak:.0f} ok={int(gen_ok)}",
               flush=True)
         zero_grads(all_params)
-        torch.cuda.reset_peak_memory_stats()
+        reset_peak(device)
         start = time.perf_counter()
         floss, tau = run.fake_update(z, text, r, x0_hat)
-        torch.cuda.synchronize()
+        synchronize(device)
         fake_seconds = time.perf_counter() - start
         sums = {k: grad_sum(v) for k, v in groups.items()}
         fake_ok = (sums["fake_lora"] > 0 and sums["fake_head"] > 0 and sums["gen_lora"] == 0 and sums["dir_head"] == 0
@@ -334,19 +335,22 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
               f"grad_fake_lora={sums['fake_lora']:.3g} grad_fake_head={sums['fake_head']:.3g} "
               f"grad_gen_lora={sums['gen_lora']:.3g} grad_dir_head={sums['dir_head']:.3g} "
               f"grad_adapter={sums['adapter']:.3g} seconds={fake_seconds:.2f} "
-              f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f} ok={int(fake_ok)}", flush=True)
+              f"peak_mb={peak_mb(device):.0f} ok={int(fake_ok)}", flush=True)
         zero_grads(all_params)
 
 
 # ------------------------------------------------------------------------------- main
 
-def make_optimizer(groups, betas=(0.9, 0.999)):
+def make_optimizer(groups, betas=(0.9, 0.999), device="cuda"):
+    """bitsandbytes AdamW8bit on CUDA when installed, else torch AdamW (MPS, CPU)."""
     betas = tuple(betas)
-    try:
-        import bitsandbytes as bnb
-        return bnb.optim.AdamW8bit(groups, weight_decay=0.0, betas=betas), "adamw8bit"
-    except ImportError:
-        return torch.optim.AdamW(groups, weight_decay=0.0, betas=betas), "adamw"
+    if torch.device(device).type == "cuda":
+        try:
+            import bitsandbytes as bnb
+            return bnb.optim.AdamW8bit(groups, weight_decay=0.0, betas=betas), "adamw8bit"
+        except ImportError:
+            pass
+    return torch.optim.AdamW(groups, weight_decay=0.0, betas=betas), "adamw"
 
 
 def parse_tau(value: str):
@@ -392,7 +396,8 @@ def main() -> None:
                              "min(D, (1+n)/(10+n)); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
     parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
+    parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU (CUDA only); >0 turns on checkpointing")
+    add_device_arg(parser)
     parser.add_argument("--holdout", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=0, help="0 = save only at the end")
@@ -419,7 +424,8 @@ def main() -> None:
     if lot and args.pairs is None:
         raise SystemExit("a non-dense --schedule needs --pairs (the frozen bank)")
 
-    device = torch.device("cuda")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     train_items, held_items = [], []
@@ -472,8 +478,8 @@ def main() -> None:
     if adapter_params:
         gen_groups.append({"params": adapter_params, "lr": args.lr})
     fake_groups = fake_lora_groups + [{"params": list(fake_head.parameters()), "lr": args.fake_lr}]
-    gen_opt, opt_name = make_optimizer(gen_groups, args.betas)
-    fake_opt, _ = make_optimizer(fake_groups, args.betas)
+    gen_opt, opt_name = make_optimizer(gen_groups, args.betas, device)
+    fake_opt, _ = make_optimizer(fake_groups, args.betas, device)
     param_groups = {
         "gen_lora": [p for g in gen_lora_groups for p in g["params"]],
         "dir_head": list(head.parameters()),
@@ -520,7 +526,7 @@ def main() -> None:
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
           f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} "
-          f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
+          f"allocated_mb={allocated_mb(device):.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
     if args.check:
@@ -637,7 +643,7 @@ def main() -> None:
             print(f"LOT_H3 kind=dir step={step} r={r} dmd={stats['dmd']:.4g} fake_loss={record['fake_loss']:.4f} "
                   f"fake_real={stats['fake_real']:.4f} hat_real={stats['hat_real']:.4f} grad_norm={record['grad_norm']:.3g} "
                   f"s_per_step={(time.perf_counter() - started) / (step - args.resume_step):.2f} "
-                  f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
+                  f"peak_mb={peak_mb(device):.0f}", flush=True)
         if args.eval_every and step % args.eval_every == 0:
             evaluate(step)
         if args.save_every and step % args.save_every == 0:

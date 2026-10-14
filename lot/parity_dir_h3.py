@@ -21,11 +21,14 @@ adaln_proj, max |diff| 4e-6; block 20, 1e-4), and the 50-block stack amplifies t
 forward already has 2 rows). ``T0_BOUND`` is a noise ceiling for that one case, not a tolerance on a bug:
 a wrong row or index changes the output by O(1) (see c_moved).
 
-    python3 lot/parity_dir_h3.py
+    python3 lot/parity_dir_h3.py [--device mps] [--dequant]
+
+``--dequant`` runs it on the bf16-dequantized base (``load_dit(dequant_bf16=True)``, the MPS default).
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -34,6 +37,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lot_paths import LOT_H3_CHECKPOINT  # noqa: E402
 
+from devices import add_device_arg, peak_mb, pick_device, swap_for  # noqa: E402
 from gpu_guard import refuse_if_busy  # noqa: E402
 
 CHECKPOINT = LOT_H3_CHECKPOINT
@@ -47,24 +51,29 @@ def rel_rms(left: torch.Tensor, right: torch.Tensor) -> float:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    add_device_arg(parser)
+    parser.add_argument("--dequant", action="store_true", help="bf16-dequantized base (default on non-CUDA devices)")
+    args = parser.parse_args()
     refuse_if_busy("parity_dir_h3.py")
+    device = pick_device(args.device)
     if not CHECKPOINT.is_file():
         raise SystemExit(f"missing checkpoint {CHECKPOINT}")
     from dir_h3 import DirHead, generator_step, probe_temb_dim
     from h3_musubi import (_layout, audio_sigma, forward_video, load_dit, predict, video_modulation_rewrite)
     from musubi_tuner.minimax_h3.packing import build_timestep_rows
 
-    model = load_dit(CHECKPOINT, swap=32)
+    model = load_dit(CHECKPOINT, device=device, swap=swap_for(device, 32), dequant_bf16=args.dequant or None)
     torch.manual_seed(0)
     height = width = 16
-    z = torch.randn(1, 24, 1, height, width, device="cuda", dtype=torch.float32)
-    text = torch.randn(1, 4, model.config.text_dim, device="cuda", dtype=torch.bfloat16)
+    z = torch.randn(1, 24, 1, height, width, device=device, dtype=torch.float32)
+    text = torch.randn(1, 4, model.config.text_dim, device=device, dtype=torch.bfloat16)
     temb_dim = probe_temb_dim(model)
     hidden = model.config.hidden_size
     count = (height // 2) * (width // 2)
 
     def audio():
-        return torch.Generator("cuda").manual_seed(0)
+        return torch.Generator(device).manual_seed(0)
 
     def stock(t):
         with torch.inference_mode():
@@ -84,12 +93,12 @@ def main() -> None:
 
     gap_a = rel_rms(hooked(t), base)
     ok_a = within(hooked(t), base)
-    zero_delta = torch.zeros(temb_dim, device="cuda")
-    zero_extra = torch.zeros(1, count, hidden, device="cuda")
+    zero_delta = torch.zeros(temb_dim, device=device)
+    zero_extra = torch.zeros(1, count, hidden, device=device)
     gap_b = rel_rms(hooked(t, video_temb_delta=zero_delta, video_extra=zero_extra), base)
     ok_b = within(hooked(t, video_temb_delta=zero_delta, video_extra=zero_extra), base)
 
-    delta = 0.5 * torch.randn(temb_dim, device="cuda")
+    delta = 0.5 * torch.randn(temb_dim, device=device)
     moved = rel_rms(hooked(t, video_temb_delta=delta), base)
     layout = _layout(text.shape[1], 1, height, width)
     rows = build_timestep_rows(layout, text_token_tags=torch.ones(1, 4, dtype=torch.int64),
@@ -103,7 +112,7 @@ def main() -> None:
     video_moved = bool(torch.all(after[video_slice] == 3 * new_index))
     ok_c = moved > 10 * limit and untouched and video_moved and segments[-1][2] == 3 * new_index
 
-    head = DirHead(hidden, temb_dim).cuda()
+    head = DirHead(hidden, temb_dim).to(device)
     with torch.inference_mode():
         step = generator_step(model, head, z, torch.zeros_like(z), 0, text, audio_generator=audio())
     with torch.inference_mode():
@@ -114,12 +123,11 @@ def main() -> None:
     ok_d = gap_d <= max(1e-4, 2.0 * floor) and float((step - reference).abs().max()) <= 1e-2 and stock_gap <= T0_BOUND
 
     ok = int(ok_a and ok_b and ok_c and ok_d and floor <= 1e-3)
-    peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
     print(
         "LOT_H3 kind=dir_parity "
         f"temb_dim={temb_dim} hidden={hidden} rel_rms_floor={floor:.6g} "
         f"a={gap_a:.6g}/{int(ok_a)} b={gap_b:.6g}/{int(ok_b)} c_moved={moved:.6g}/{int(ok_c)} "
-        f"d={gap_d:.6g}/{int(ok_d)} d_vs_stock_t0={stock_gap:.6g} peak_mb={peak_mb:.1f} dtype=bf16 ok={ok}"
+        f"d={gap_d:.6g}/{int(ok_d)} d_vs_stock_t0={stock_gap:.6g} peak_mb={peak_mb(device):.1f} dtype=bf16 ok={ok}"
     )
     if not ok:
         raise SystemExit(1)

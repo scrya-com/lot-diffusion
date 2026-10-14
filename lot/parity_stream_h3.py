@@ -13,7 +13,7 @@ script is alive):
 (c) the done-row embedding and a full memory move the output (O(1) wiring, not rounding).
 (d) seconds and peak memory of one window forward at ``--time-size`` with and without a full memory.
 
-    python3 lot/parity_stream_h3.py [--time-size 48 48] [--capacity 16] [--pool 4]
+    python3 lot/parity_stream_h3.py [--time-size 48 48] [--capacity 16] [--pool 4] [--device mps] [--dequant]
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lot_paths import LOT_H3_CHECKPOINT  # noqa: E402
 
+from devices import add_device_arg, peak_mb, pick_device, reset_peak, swap_for, synchronize  # noqa: E402
 from gpu_guard import refuse_if_busy  # noqa: E402
 
 T0_BOUND = 0.15
@@ -46,10 +47,14 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=7, help="window latent frames (5n+2)")
     parser.add_argument("--capacity", type=int, default=16, help="memory keyframes in the timed run")
     parser.add_argument("--pool", type=int, default=4)
-    parser.add_argument("--swap", type=int, default=32)
+    parser.add_argument("--swap", type=int, default=32, help="blocks streamed from CPU (CUDA only)")
+    parser.add_argument("--dequant", action="store_true", help="bf16-dequantized base (default on non-CUDA devices)")
+    add_device_arg(parser)
     args = parser.parse_args()
 
     refuse_if_busy("parity_stream_h3.py")
+    device = pick_device(args.device)
+    args.swap = swap_for(device, args.swap)
     if not LOT_H3_CHECKPOINT.is_file():
         raise SystemExit(f"missing checkpoint {LOT_H3_CHECKPOINT}")
     from dir_h3 import DirHead, generator_step, probe_temb_dim
@@ -58,18 +63,18 @@ def main() -> None:
                                rows_per_window, stream_forward, stream_layout)
 
     check_window(args.frames)
-    model = load_dit(LOT_H3_CHECKPOINT, swap=args.swap)
+    model = load_dit(LOT_H3_CHECKPOINT, device=device, swap=args.swap, dequant_bf16=args.dequant or None)
     temb_dim, hidden = probe_temb_dim(model), model.config.hidden_size
     iterations = 4
     torch.manual_seed(0)
     frames, height, width = args.frames, 16, 16
-    z = torch.randn(1, 24, frames, height, width, device="cuda")
-    text = torch.randn(1, 4, model.config.text_dim, device="cuda", dtype=torch.bfloat16)
-    head = StreamHead(hidden, temb_dim, iterations).cuda()
-    still = DirHead(hidden, temb_dim, iterations).cuda()
+    z = torch.randn(1, 24, frames, height, width, device=device)
+    text = torch.randn(1, 4, model.config.text_dim, device=device, dtype=torch.bfloat16)
+    head = StreamHead(hidden, temb_dim, iterations).to(device)
+    still = DirHead(hidden, temb_dim, iterations).to(device)
 
     def audio():
-        return torch.Generator("cuda").manual_seed(0)
+        return torch.Generator(device).manual_seed(0)
 
     def stream(r, **kw):
         with torch.inference_mode():
@@ -87,14 +92,14 @@ def main() -> None:
     ok_a = gap_a <= limit and float((got - reference).abs().max()) <= 1e-2
 
     # (b) FL2VA first: frame 0 done (its estimate is the condition), against the stock call
-    first = torch.randn(1, 24, 1, height, width, device="cuda")
+    first = torch.randn(1, 24, 1, height, width, device=device)
     estimate = torch.zeros_like(z)
     estimate[:, :, :1] = first
     r_first = [iterations] + [0] * (frames - 1)
     layout = stream_layout(text.shape[1], frames, height, width, first=True, memory=0)
     sigma_a = float(audio_sigma(1.0))
     with torch.inference_mode():
-        stock = model(video_latents=z, audio_latents=_silence(frames, sigma_a, "cuda", audio()), text_hidden_states=text,
+        stock = model(video_latents=z, audio_latents=_silence(frames, sigma_a, device, audio()), text_hidden_states=text,
                       text_token_tags=torch.ones(1, 4, dtype=torch.int64), layout=layout, model_t_video=0.0,
                       model_t_audio=1.0 - sigma_a, visual_condition_latents=[first]).video.float()
     got_b = stream(r_first, estimate=estimate, first=first)
@@ -115,8 +120,8 @@ def main() -> None:
 
     # (d) timing of one window at the training / render size
     th, tw = args.time_size
-    zt = torch.randn(1, 24, frames, th, tw, device="cuda")
-    ft = torch.randn(1, 24, 1, th, tw, device="cuda")
+    zt = torch.randn(1, 24, frames, th, tw, device=device)
+    ft = torch.randn(1, 24, 1, th, tw, device=device)
     et = torch.zeros_like(zt)
     et[:, :, :1] = ft
     timed = {}
@@ -124,17 +129,17 @@ def main() -> None:
         entries = [MemoryEntry(coarse_tokens(torch.randn(1, 24, 1, th, tw), args.pool), pooled_centres(th, tw, args.pool),
                                -30.0 * (capacity - k)) for k in range(capacity)]
         memory = memory_rows(entries, 0.0) if capacity else None
-        torch.cuda.reset_peak_memory_stats()
+        reset_peak(device)
         seconds = []
         for _ in range(3):
-            torch.cuda.synchronize()
+            synchronize(device)
             start = time.perf_counter()
             with torch.inference_mode():
                 stream_forward(model, head, zt, et, torch.tensor(r_first), text, first=ft, memory=memory,
                                audio_generator=audio())
-            torch.cuda.synchronize()
+            synchronize(device)
             seconds.append(time.perf_counter() - start)
-        timed[capacity] = (min(seconds[1:]), torch.cuda.max_memory_allocated() / 2**20,
+        timed[capacity] = (min(seconds[1:]), peak_mb(device),
                            rows_per_window((frames, th, tw), memory=capacity, pool=args.pool, text_length=text.shape[1]))
 
     ok = int(ok_a and ok_b and ok_c and floor <= 1e-3)
