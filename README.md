@@ -19,7 +19,7 @@ The VAE decode is not shortened; LoT only touches the transformer. Reproduce wit
 
 | Path | What |
 |---|---|
-| [`lot/`](lot) | The method (`layout`, `flow`, `adapter`, `layout_sources`), the H3 contract (`h3`, `h3_positions`, `h3_splice`), the H3 runtime glue (`h3_musubi.py`), and scripts to cache data, fit the extent bank, train, render and time. Also an experimental, untested DiR few-step generator (`dir_h3.py`, `render_dir_h3.py`; no trained weights yet). Start at [`lot/CHEATSHEET.md`](lot/CHEATSHEET.md); the full walkthrough is [`lot/README.md`](lot/README.md). |
+| [`lot/`](lot) | The method (`layout`, `flow`, `adapter`, `layout_sources`), the H3 contract (`h3`, `h3_positions`, `h3_splice`), the H3 runtime glue (`h3_musubi.py`), and scripts to cache data, fit the extent bank, train, render and time. Also an experimental DiR few-step generator (ByteDance Seed's data-space iteration: `dir_h3.py`, `train_dir_h3.py`, streaming `stream_dir_h3.py`); start at [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md). Start at [`lot/CHEATSHEET.md`](lot/CHEATSHEET.md); the full walkthrough is [`lot/README.md`](lot/README.md). |
 | [`third_party/musubi_tuner/`](third_party) | The subset of [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) that runs H3: model, packing, ConvRot int8 loader, block swap, LoRA network, video VAE, text encoder. Copied unmodified (Apache-2.0); see [`NOTICE`](NOTICE). |
 | [`comfyui/`](comfyui) | API-format ComfyUI workflows (still, clip, face-box layout). The nodes are in [ComfyUI-MiniMax-H3-Image-Lane](https://github.com/scrya-com/ComfyUI-MiniMax-H3-Image-Lane). |
 

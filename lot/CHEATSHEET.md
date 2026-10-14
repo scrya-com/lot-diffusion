@@ -154,9 +154,9 @@ cp /tmp/lot/run4_nikki_distill/lora.safetensors    ComfyUI/models/loras/minimax_
 
 Inside ComfyUI, a 1×1 `dense` layout reproduces the stock forward exactly (relative error 0 with ComfyUI's bf16 head weights). `center` ran at 5.6 vs 4.1 it/s on a 768×1152 still (1.35×) and **3.45 vs 1.33 it/s on a 22-frame 512×768 clip (2.6×)**. The output is visibly softer than dense: **research weights, more training wanted** ([help-wanted discussion](https://github.com/scrya-com/lot-diffusion/discussions/1)).
 
-## Experimental: DiR few-step (no trained weights yet)
+## Experimental: DiR few-step
 
-DiR iterates the clean estimate (`x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)`, R = 4, same noise, σ pinned to 1) and trains with DMD ([arXiv 2610.12102](https://arxiv.org/abs/2610.12102)). **Smoke-tested only (2-step run, eval, save, render); every measured number is TODO.** Details: [README → DiR](README.md#experimental-dir-few-step-generation-dir_h3py).
+DiR (ByteDance Seed's data-space iteration) iterates the clean estimate (`x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)`, R = 4, same noise, σ pinned to 1) and trains with DMD ([arXiv 2610.12102](https://arxiv.org/abs/2610.12102)). One 1,000-step run exists: 5.4× less DiT time than dense H3, with pictures not yet done ([issue #3](https://github.com/johndpope/MiniMax-H3/issues/3)). **Start here: [`DIR_CHEATSHEET.md`](../DIR_CHEATSHEET.md)** (samples, cache, training, renders, streaming). Details: [README → DiR](README.md#experimental-dir-few-step-generation-dir_h3py).
 
 ```bash
 python3 lot/parity_dir_h3.py                                     # GPU, must pass first -> ok=1
