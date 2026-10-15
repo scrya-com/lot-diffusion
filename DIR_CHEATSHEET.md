@@ -116,6 +116,23 @@ grep '"eval"' lot/runs/my_dir/log.jsonl | tail -2      # held-out gap to the rea
 
 **Saves** are written to `--out` every `--save-every` steps: `lora_gen_N`, `dir_head_N`, `lora_fake_N`, `dir_fake_head_N`, and with `--ema` also `*_N_ema`.
 
+### Warm start from Minimax-H3-Turbo (experimental)
+
+[LightX2V's Turbo LoRAs](https://github.com/ModelTC/Minimax-H3-Turbo) (Apache-2.0) are far ahead of run 1 ([dir-diffusion#1](https://github.com/scrya-com/dir-diffusion/issues/1)). Converting one gives DiR a much better starting point than base H3's one-step blur:
+
+```bash
+hf download lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors --local-dir turbo
+python3 lot/turbo_lora.py turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors --rank 128 --out lot/runs/turbo4_init
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 128 --fake-rank 64 --swap 12 --ema 0 \
+  --max-latent-hw 48 48 --dmd-weight paper --betas 0.9 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 --accum 2 \
+  --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo
+```
+
+- **What converts exactly:** out_proj, fc1 and fc2.
+- **What is approximated:** Turbo's fused qkv (rank 384) is cut to rank 128 by SVD, which keeps 92–99.9% of its energy per block.
+- **What is dropped:** the 2 token-refiner blocks.
+- **Memory:** rank 128 on a 24 GB card needs `--swap 12` and `--ema 0`. The `--check` peak is about 20.5 GB before optimizer state. `--fake-rank` keeps the fake model smaller.
+
 ## 5. Render and compare
 
 ```bash

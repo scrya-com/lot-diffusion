@@ -391,7 +391,8 @@ def main() -> None:
                         help="EMA decay of the generator's trainable params (0 = off), with warm-up "
                              "min(D, (1+n)/(10+n)); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
-    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--rank", type=int, default=16, help="generator LoRA rank (and the fake's, unless --fake-rank)")
+    parser.add_argument("--fake-rank", type=int, default=None, help="fake-model LoRA rank (default: --rank)")
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
     parser.add_argument("--holdout", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=100)
@@ -442,7 +443,7 @@ def main() -> None:
     dit = load_dit(device=device, swap=args.swap, train=True)
     hidden, temb_dim = dit.config.hidden_size, probe_temb_dim(dit)
     gen_net = make_lora(dit, args.rank)          # applied first
-    fake_net = make_lora(dit, args.rank)         # wraps the generator LoRA's forward; .enabled switches each off
+    fake_net = make_lora(dit, args.fake_rank or args.rank)   # wraps the generator LoRA's forward; .enabled switches each off
     if args.init is not None:
         lora_file = next(f for f in (args.init / "lora_gen.safetensors", args.init / "lora.safetensors") if f.is_file())
         info = gen_net.load_weights(str(lora_file))
@@ -530,7 +531,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     log = open(args.out / "log.jsonl", "a")
     meta = {"iters": args.iterations, "holdout": args.holdout,
-            "cache": [str(c) for c in (args.cache or [LOT_H3_STILLS_CACHE])], "schedule": args.schedule, "rank": args.rank, "temb_dim": temb_dim,
+            "cache": [str(c) for c in (args.cache or [LOT_H3_STILLS_CACHE])], "schedule": args.schedule, "rank": args.rank, "fake_rank": args.fake_rank or args.rank, "temb_dim": temb_dim,
             "hidden": hidden, "lot": lot, "pairs": None if args.pairs is None else str(args.pairs),
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),

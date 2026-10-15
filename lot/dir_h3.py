@@ -266,7 +266,7 @@ def save_dir_run(run_dir, tag: str, *, head: DirHead, fake_head, gen_network, fa
         torch.save(fake_head.state_dict(), run_dir / f"dir_fake_head{tag}.pt")
     gen_network.save_weights(str(run_dir / f"lora_gen{tag}.safetensors"), torch.bfloat16, {"lot_h3": "dir", "kind": "gen", "rank": str(meta["rank"])})
     if not gen_only:
-        fake_network.save_weights(str(run_dir / f"lora_fake{tag}.safetensors"), torch.bfloat16, {"lot_h3": "dir", "kind": "fake", "rank": str(meta["rank"])})
+        fake_network.save_weights(str(run_dir / f"lora_fake{tag}.safetensors"), torch.bfloat16, {"lot_h3": "dir", "kind": "fake", "rank": str(meta.get("fake_rank", meta["rank"]))})
     if adapter is not None:
         torch.save(dict(adapter.state_dict()), run_dir / f"adapter{tag}.pt")
     (run_dir / "config.json").write_text(json.dumps(meta, indent=1))
