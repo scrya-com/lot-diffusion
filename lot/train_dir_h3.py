@@ -23,6 +23,22 @@ normaliser, detached):
 (``--dmd-weight paper`` uses the paper's w(tau) = 1 instead: ``grad = (x0_fake - x0_real) / tau``.
 ``--betas``, ``--grad-clip`` and ``--ema`` expose the paper's optimizer settings; see CHEATSHEET.)
 
+Real-data term (``--priming-weight``, off by default), after Priming Models (Park, Kim, Du, Chen,
+Han; arXiv 2610.20331): their post-training loss F = D(a, y) - D(a, sg[a']) between generated
+samples ``a``, real samples ``y`` and stop-gradient generated references ``a'``, with D an
+entropic-OT cost in a frozen feature space. Here the feature space is the latent itself, ``y`` is
+the cache item's own clean latent (one real sample per prompt, as their text-to-image setup) and
+``a'`` are ``--priming-refs`` fresh no-grad rollouts at the same prompt and ``r``. With one live
+sample per prompt both transport plans are uniform, so the OT cost is the mean squared distance
+and the gradient is closed-form:
+
+    s2 = 0.5 * (mean (a - y)^2 + mean_k mean (a - a'_k)^2)      (their pair-RMS scale, detached)
+    grad_prime = (mean_k a'_k - y) / s2                          (same units/1/N convention as grad)
+
+It moves every sample by the same displacement (the generator's mean toward ``y``), which is why
+it does not collapse diversity the way plain regression to ``y`` would. The references use their
+own random generator, so turning it on leaves every other draw (prompt, z, r, tau, eps) unchanged.
+
 Sign: the loss' gradient with respect to ``x0_hat`` is ``(x0_hat - target) = grad / N``, so
 descent moves ``x0_hat`` along ``-grad = (x0_real - x0_fake) * w``: toward what the real model
 thinks is clean and away from what the fake model (the generator's own distribution) thinks.
@@ -89,6 +105,9 @@ class Run:
         self.iterations = args.iterations
         self.loss_scale = 1.0       # 1 / --accum while accumulating; backward() scales by it
         self._schedules: dict = {}
+        # Priming references draw from their own stream so the global torch RNG (z, tau, eps) is
+        # the same with and without --priming-weight: a paired A/B against a run without it.
+        self.prime_rng = torch.Generator().manual_seed(args.seed + 7919)
 
     def schedule(self, z: torch.Tensor) -> list:
         """Layouts for ``z``'s token grid (cached per shape)."""
@@ -132,8 +151,25 @@ class Run:
         return float(tau.clamp(TAU_MIN, TAU_MAX))
 
     # -------------------------------------------------------------------- generator update
-    def generator_update(self, z, text, r, *, backward=True):
-        """One DMD generator step. Returns ``(loss, x0_hat value, stats)``.
+    @torch.no_grad()
+    def priming_grad(self, x0_hat, real, r, text, schedule):
+        """Priming's latent-space real-data gradient for ``x0_hat`` (see the module docstring)."""
+        refs = []
+        for _ in range(self.args.priming_refs):
+            z_ref = torch.randn(x0_hat.shape, generator=self.prime_rng).to(x0_hat.device, x0_hat.dtype)
+            seed = int(torch.randint(0, 2**31 - 1, (1,), generator=self.prime_rng))
+            prev = self.rollout(z_ref, r, text, schedule, seed)
+            with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
+                refs.append(self.one_step(z_ref, prev, r, text, schedule, seed))
+        cross = (x0_hat - real).pow(2).mean()
+        self_term = sum((x0_hat - ref).pow(2).mean() for ref in refs) / len(refs)
+        s2 = (0.5 * (cross + self_term)).clamp(min=1e-6)
+        grad = (sum(refs) / len(refs) - real) / s2
+        return grad, {"prime_cross": float(cross), "prime_self": float(self_term), "prime_s2": float(s2)}
+
+    def generator_update(self, z, text, r, *, real=None, backward=True):
+        """One DMD generator step. Returns ``(loss, x0_hat value, stats)``. ``real`` is the item's
+        clean latent, used only by ``--priming-weight``.
 
         Order matters with block swap: the offloader is in forward-only mode under no_grad and
         in training mode for the grad forward, and switching modes between a grad forward and
@@ -170,12 +206,20 @@ class Run:
             else:
                 weight = 1.0 / gap          # DMD2's normaliser (detached), the default
             grad = (x0_fake - x0_real) * weight
+            grad_prime, prime_stats = None, {}
+            if self.args.priming_weight > 0:
+                if real is None:
+                    raise ValueError("--priming-weight needs the item's real latent")
+                grad_prime, prime_stats = self.priming_grad(x0_hat, real, r, text, schedule)
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             with torch.enable_grad():
                 x0_hat_g = self.one_step(z, estimate, r, text, schedule, seed)
                 dmd = 0.5 * F.mse_loss(x0_hat_g, (x0_hat_g.detach() - grad))   # d/dx0_hat_g = grad / N
                 loss = dmd
-                ot = None
+                ot = prime = None
+                if grad_prime is not None:
+                    prime = 0.5 * F.mse_loss(x0_hat_g, (x0_hat_g.detach() - grad_prime))   # d/dx0_hat_g = grad_prime / N
+                    loss = loss + self.args.priming_weight * prime
                 if self.args.ot_weight > 0:
                     ot = F.mse_loss(x0_hat_g, z)   # eq. 14: |G(x0_hat[r], z, r) - z|^2 (x - z = the head output)
                     loss = loss + self.args.ot_weight * ot
@@ -184,6 +228,9 @@ class Run:
         stats = {"loss": float(loss.detach()), "dmd": float(dmd.detach()), "tau": tau, "w": float(weight),
                  "fake_real": float((x0_fake - x0_real).abs().mean()), "hat_real": float(gap),
                  "ot": None if ot is None else float(ot.detach()),
+                 "grad_rms": float(grad.pow(2).mean().sqrt()),
+                 "prime_rms": None if grad_prime is None else float(grad_prime.pow(2).mean().sqrt()),
+                 **prime_stats,
                  "hat_rms": float(x0_hat.pow(2).mean().sqrt()),
                  "match": float((x0_hat_g.detach() - x0_hat).abs().max())}
         return loss, x0_hat.detach(), stats
@@ -307,7 +354,7 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         start = time.perf_counter()
-        loss, x0_hat, stats = run.generator_update(z, text, r)
+        loss, x0_hat, stats = run.generator_update(z, text, r, real=x0)
         torch.cuda.synchronize()
         gen_seconds = time.perf_counter() - start
         gen_peak = torch.cuda.max_memory_allocated() / 2**20
@@ -321,6 +368,10 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
               f"grad_adapter={sums['adapter']:.3g} grad_fake_lora={sums['fake_lora']:.3g} "
               f"grad_fake_head={sums['fake_head']:.3g} seconds={gen_seconds:.2f} peak_mb={gen_peak:.0f} ok={int(gen_ok)}",
               flush=True)
+        if stats["prime_rms"] is not None:
+            print(f"LOT_H3 kind=dir_check_priming r={r} grad_rms={stats['grad_rms']:.4g} prime_rms={stats['prime_rms']:.4g} "
+                  f"weighted_ratio={run.args.priming_weight * stats['prime_rms'] / max(stats['grad_rms'], 1e-12):.3g} "
+                  f"cross={stats['prime_cross']:.4g} self={stats['prime_self']:.4g} s2={stats['prime_s2']:.4g}", flush=True)
         zero_grads(all_params)
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
@@ -391,6 +442,10 @@ def main() -> None:
                         help="EMA decay of the generator's trainable params (0 = off), with warm-up "
                              "min(D, (1+n)/(10+n)); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
+    parser.add_argument("--priming-weight", type=float, default=0.0,
+                        help="Priming Models' real-data term in latent space (arXiv 2610.20331; 0 = off), see docstring")
+    parser.add_argument("--priming-refs", type=int, default=1,
+                        help="no-grad reference rollouts per sample for --priming-weight (each costs r + 1 forwards)")
     parser.add_argument("--rank", type=int, default=16, help="generator LoRA rank (and the fake's, unless --fake-rank)")
     parser.add_argument("--fake-rank", type=int, default=None, help="fake-model LoRA rank (default: --rank)")
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
@@ -520,7 +575,7 @@ def main() -> None:
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
-          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} "
+          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -535,7 +590,8 @@ def main() -> None:
             "hidden": hidden, "lot": lot, "pairs": None if args.pairs is None else str(args.pairs),
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
-            "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0}
+            "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
+            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
@@ -597,7 +653,7 @@ def main() -> None:
             z = torch.randn_like(x0)
             r = rng.randrange(args.iterations)
             run.loss_scale = 1.0 / args.accum
-            _loss, x0_hat, stats = run.generator_update(z, text, r)
+            _loss, x0_hat, stats = run.generator_update(z, text, r, real=x0)
             if not math.isfinite(stats["loss"]):
                 raise RuntimeError(f"step {step}: generator loss {stats['loss']}")
             samples.append((z, text, r, x0_hat))
