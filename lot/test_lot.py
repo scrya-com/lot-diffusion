@@ -828,6 +828,23 @@ def test_dir_use_networks_restores():
 
 # ------------------------------------------------------------------------- streaming DiR
 
+def test_dir_paper_init():
+    """--paper-init: Xavier x0_proj with a zero, frozen bias; r embeddings ~ N(0, 0.02); default stays zero."""
+    from dir_h3 import DirFakeHead, DirHead
+
+    zero = DirHead(512, 8, 4)
+    assert float(zero.x0_proj.weight.abs().max()) == 0.0 and float(zero.r_embed.abs().max()) == 0.0
+    head = DirHead(512, 8, 4).paper_init(torch.Generator().manual_seed(0))
+    bound = (6.0 / (96 + 512)) ** 0.5
+    w = head.x0_proj.weight
+    assert float(w.abs().max()) <= bound and float(w.std()) > 0.5 * bound / 3 ** 0.5
+    assert float(head.x0_proj.bias.abs().max()) == 0.0 and not head.x0_proj.bias.requires_grad
+    assert 0.01 < float(head.r_embed.std()) < 0.04
+    fake = DirFakeHead(8, 4).paper_init(torch.Generator().manual_seed(1))
+    assert 0.01 < float(fake.fake_r_embed.std()) < 0.04
+    head.load_state_dict(zero.state_dict())          # old zero-init checkpoints still load
+
+
 def test_dir_sigma_schedule_is_euler():
     """Zero head: all-ones sigmas keep the paper's pinned DiR (state = z); a schedule below 1 is
     H3's deterministic Euler sampler on that grid from the same z (Turbo's grid primes DiR)."""
@@ -1158,6 +1175,7 @@ def main():
         test_dir_video_modulation_rewrite,
         test_dir_use_networks_restores,
         test_dir_ema_warmup,
+        test_dir_paper_init,
         test_dir_sigma_schedule_is_euler,
         test_stream_layout_and_positions_match_stock,
         test_stream_frame_modulation_rewrite,

@@ -133,9 +133,32 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
 - **What is dropped:** the 2 token-refiner blocks.
 - **Memory:** rank 128 on a 24 GB card needs `--swap 12` and `--ema 0`. The `--check` peak is about 20.5 GB before optimizer state. `--fake-rank` keeps the fake model smaller.
 
-### Make the iterations refine: `--sigmas` (experimental)
+### Faithful to the paper: `--paper-init`, `--r-schedule mod`, `--betas 0 0.95`
 
-With the paper's setup (`--sigmas 1`, the default), every iteration runs H3 at σ = 1 on the same `z`. The previous estimate only gets in through `DirHead.x0_proj`, which starts at zero and grows about one learning rate per Adam step. So r = 4 looked like r = 1 in every run so far ([dir-diffusion#2](https://github.com/scrya-com/dir-diffusion/issues/2)).
+In every run up to run D, r = 4 looked like r = 1 ([dir-diffusion#2](https://github.com/scrya-com/dir-diffusion/issues/2)). The main cause was ours, not the paper's: we initialised the added parameters at **zero** (so step 0 equals H3 exactly). The previous estimate's only path, `DirHead.x0_proj`, then starts dead and grows at most about one learning rate per Adam step. The paper (appendix A) does it differently:
+
+| Paper (appendix A, Table 4) | Flag | Default here |
+|---|---|---|
+| `x0` projection initialised like SiT's input projection (Xavier), **no bias** | `--paper-init` | zeros (step 0 == H3) |
+| `r` embedding (generator and fake) ~ N(0, 0.02) | `--paper-init` | zeros |
+| `r = step mod R` | `--r-schedule mod` | random per sample |
+| Adam (0.0, 0.95); β1 = 0 helped at every NFE | `--betas 0 0.95` | (0.9, 0.999) |
+| flow time fixed at t = 1 | `--sigmas 1` | `1` |
+| EMA 0.9999 | `--ema 0.9999` | off (doesn't fit at rank 128 on 24 GB) |
+
+```bash
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 128 --fake-rank 64 --swap 12 --ema 0 \
+  --max-latent-hw 48 48 --dmd-weight paper --betas 0 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 --accum 2 \
+  --sigmas 1 --paper-init --r-schedule mod --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_paper
+```
+
+- **`--head-lr`** (not in the paper) gives `x0_proj` and `r_embed` their own learning rate. It compensates for our budget: LoRA at batch 2 for about 1,000 steps, against the paper's full fine-tune at batch 256 for 40 epochs.
+- **`--paper-init` only touches parameters that aren't loaded.** A `--init` run with a `dir_head.pt`, or a `--resume-step`, keeps its saved values. The Turbo init has no head, so it gets the paper init.
+- **Expect modest gains even when it works.** The paper's own FID by iteration is 3.85 / 2.68 / 2.47 / 2.46: most of the gain is r = 1 → 2.
+
+### Flow-map baseline (not DiR): `--sigmas` (experimental)
+
+**`--sigmas` below 1 departs from the paper.** It builds states at intermediate flow times, which is the paper's *flow-map* baseline (Table 3: FID 2.55 at 4 NFE, against DiR's 2.46). DiR's point is to remove that schedule. Keep `--sigmas 1` to reproduce the paper, and use a grid only as a comparison or a starting point.
 
 `--sigmas` gives each iteration its own flow time. Iteration r runs on a deterministic Euler state built from the same `z` and its earlier estimates, still with no renoising. With a zero head, the generator at step 0 is its LoRA's own 4-step sampler, so later iterations refine from the start.
 
@@ -160,7 +183,7 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
 - **The run records it:** `config.json` stores `sigmas`, and `render_dir_h3.py` reads it, so renders use the run's schedule unless `--sigmas` overrides it.
 - **Dense layouts only:** a LoT `--schedule` needs `--sigmas 1`.
 - **Cost:** none in memory. DiR iterations rendered at about 7.5 s each, against 3.5 s pinned, at 768×1152. Not yet explained.
-- **Status:** whether DMD training keeps the per-iteration improvement is being tested (arm C in #2).
+- **Training on it (arm C in #2):** by step 10 the per-iteration improvement had shrunk (gap r=1..4 0.247 / 0.250 / 0.237 / 0.211). DMD gives every iteration the same target, so it doesn't preserve the schedule's built-in refinement.
 - **Making a run dir for an untrained init:** copy the converted `lora_gen.safetensors` and a training run's `config.json` next to a zero `dir_head.pt`, e.g. `torch.save(DirHead(5376, 8, 4).state_dict(), 'dir_head.pt')`.
 
 ### Real-data term: `--priming-weight` (experimental)

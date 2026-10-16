@@ -74,6 +74,19 @@ class DirHead(nn.Module):
         nn.init.zeros_(self.x0_proj.bias)
         self.r_embed = nn.Parameter(torch.zeros(self.iterations, temb_dim))
 
+    def paper_init(self, generator: torch.Generator | None = None) -> "DirHead":
+        """The paper's init (appendix A): the ``x0`` projection as SiT initialises its input
+        projection (Xavier-uniform on the (hidden, 96) matrix) with no bias, and ``r_embed`` from
+        N(0, 0.02). Unlike the zero init, the estimate pathway is live from step 0 (so step 0 is
+        no longer exactly the base model). The bias is zeroed and frozen, which equals no bias and
+        keeps old checkpoints loadable."""
+        with torch.no_grad():
+            bound = (6.0 / (self.x0_proj.in_features + self.x0_proj.out_features)) ** 0.5
+            self.x0_proj.weight.uniform_(-bound, bound, generator=generator)
+            self.x0_proj.bias.zero_()
+            self.r_embed.normal_(0.0, 0.02, generator=generator)
+        self.x0_proj.bias.requires_grad_(False)
+        return self
 
 class DirFakeHead(nn.Module):
     """The fake model's iteration embedding, apart from the generator's parameters."""
@@ -82,6 +95,12 @@ class DirFakeHead(nn.Module):
         super().__init__()
         self.iterations = int(iterations)
         self.fake_r_embed = nn.Parameter(torch.zeros(self.iterations, temb_dim))
+
+    def paper_init(self, generator: torch.Generator | None = None) -> "DirFakeHead":
+        """``fake_r_embed`` from N(0, 0.02), as the paper (appendix A)."""
+        with torch.no_grad():
+            self.fake_r_embed.normal_(0.0, 0.02, generator=generator)
+        return self
 
 
 # ------------------------------------------------------------------------------ pooling

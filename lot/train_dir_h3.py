@@ -43,6 +43,15 @@ Sign: the loss' gradient with respect to ``x0_hat`` is ``(x0_hat - target) = gra
 descent moves ``x0_hat`` along ``-grad = (x0_real - x0_fake) * w``: toward what the real model
 thinks is clean and away from what the fake model (the generator's own distribution) thinks.
 
+Paper fidelity (appendix A). ``--paper-init`` initialises the added parameters as the paper does
+(``DirHead.paper_init``: Xavier ``x0_proj`` without bias, ``r_embed`` and ``fake_r_embed`` from
+N(0, 0.02)) instead of zeros; with zeros the estimate pathway starts dead and grows at most ~lr per
+Adam step, which is why r = 4 looked like r = 1. ``--r-schedule mod`` trains iteration
+``r = step mod R`` (the paper) instead of a random r per sample. ``--head-lr`` (not in the paper)
+gives the head its own learning rate. The paper's other settings are ``--betas 0 0.95``,
+``--ema 0.9999``, ``--dmd-weight paper``, ``--tau-shift beta:2.5``, ``--fake-updates 4``, ``--grad-clip 0``
+and ``--sigmas 1``.
+
 Fake update (``--fake-updates``, the paper does 4 per generator update): flow regression of the
 fake model on ``x_tau`` built from detached generator samples, conditioned on ``r``, in H3's
 ``x0 - eps`` head convention. The first one reuses the generator step's sample; the others
@@ -324,7 +333,9 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
     x0, text = train_h3.load_item(rng.choice(items), rng, device)
     z = torch.randn_like(x0)
     # Fake == real at init (fake LoRA up and fake r-embed are zero), at a mid tau.
+    saved_fake_r = run.fake_head.fake_r_embed.detach().clone()      # --paper-init: compare the LoRA alone
     with torch.no_grad():
+        run.fake_head.fake_r_embed.zero_()
         tau = 0.5
         x_tau = (1.0 - tau) * torch.zeros_like(z) + tau * z
         # The silent-audio rows are random noise per call: reseed so only the LoRA/embedding differs.
@@ -336,6 +347,8 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
         with use_networks(run.gen_net, run.fake_net, gen=False, fake=True):
             torch.manual_seed(123)
             fake = fake_x0(run.dit, run.fake_head, x_tau, tau, 0, text)
+    with torch.no_grad():
+        run.fake_head.fake_r_embed.copy_(saved_fake_r)
     init_gap, floor = rel(fake, real), rel(real2, real)
     print(f"LOT_H3 kind=dir_check_init fake_vs_real_rel={init_gap:.3g} run_to_run={floor:.3g} shape={tuple(z.shape)} "
           f"ok={int(init_gap < 1e-2)}", flush=True)
@@ -449,6 +462,13 @@ def main() -> None:
     parser.add_argument("--sigmas", default="1",
                         help="flow sigma per iteration: 1 (the paper: pinned), grid[:SHIFT] (H3's Euler grid, shift 12; any "
                              "init), turbo[:SHIFT] (shift 6, with a Turbo --init), or R comma values; see dir_h3")
+    parser.add_argument("--paper-init", action="store_true",
+                        help="the paper's init of the added params: Xavier x0_proj (no bias), r_embed and fake_r_embed "
+                             "~ N(0, 0.02); default zeros (step 0 == base). Ignored for files loaded by --init/--resume")
+    parser.add_argument("--r-schedule", choices=["random", "mod"], default="random",
+                        help="iteration trained each step: random per sample, or step mod R for the whole step (the paper)")
+    parser.add_argument("--head-lr", type=float, default=None,
+                        help="learning rate of DirHead (x0_proj, r_embed); default --lr. Not in the paper")
     parser.add_argument("--priming-weight", type=float, default=0.0,
                         help="Priming Models' real-data term in latent space (arXiv 2610.20331; 0 = off), see docstring")
     parser.add_argument("--priming-refs", type=int, default=1,
@@ -517,8 +537,13 @@ def main() -> None:
     for net in (gen_net, fake_net):
         net.requires_grad_(True)
         net.to(device=device, dtype=torch.bfloat16)
-    head = DirHead(hidden, temb_dim, args.iterations).to(device)
-    fake_head = DirFakeHead(temb_dim, args.iterations).to(device)
+    head = DirHead(hidden, temb_dim, args.iterations)
+    fake_head = DirFakeHead(temb_dim, args.iterations)
+    if args.paper_init:
+        init_rng = torch.Generator().manual_seed(args.seed + 31)
+        head.paper_init(init_rng)
+        fake_head.paper_init(init_rng)
+    head, fake_head = head.to(device), fake_head.to(device)
     if args.init is not None and (args.init / "dir_head.pt").is_file():
         head.load_state_dict(torch.load(args.init / "dir_head.pt", map_location=device, weights_only=True))
 
@@ -531,7 +556,8 @@ def main() -> None:
             p.requires_grad_(args.train_adapter)
         if not args.train_adapter:
             adapter_params = []
-    gen_groups = gen_lora_groups + [{"params": list(head.parameters()), "lr": args.lr}]
+    head_params = [p for p in head.parameters() if p.requires_grad]
+    gen_groups = gen_lora_groups + [{"params": head_params, "lr": args.head_lr or args.lr}]
     if adapter_params:
         gen_groups.append({"params": adapter_params, "lr": args.lr})
     fake_groups = fake_lora_groups + [{"params": list(fake_head.parameters()), "lr": args.fake_lr}]
@@ -539,7 +565,7 @@ def main() -> None:
     fake_opt, _ = make_optimizer(fake_groups, args.betas)
     param_groups = {
         "gen_lora": [p for g in gen_lora_groups for p in g["params"]],
-        "dir_head": list(head.parameters()),
+        "dir_head": head_params,
         "adapter": adapter_params,
         "fake_lora": [p for g in fake_lora_groups for p in g["params"]],
         "fake_head": list(fake_head.parameters()),
@@ -582,7 +608,7 @@ def main() -> None:
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
-          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} sigmas={args.sigmas} "
+          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} sigmas={args.sigmas} paper_init={int(args.paper_init)} r_schedule={args.r_schedule} head_lr={args.head_lr or args.lr} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -598,7 +624,8 @@ def main() -> None:
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
-            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas}
+            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas,
+            "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
@@ -660,7 +687,7 @@ def main() -> None:
         for _ in range(args.accum):
             x0, text = train_h3.load_item(rng.choice(train_items), rng, device)
             z = torch.randn_like(x0)
-            r = rng.randrange(args.iterations)
+            r = (step - 1) % args.iterations if args.r_schedule == "mod" else rng.randrange(args.iterations)
             run.loss_scale = 1.0 / args.accum
             _loss, x0_hat, stats = run.generator_update(z, text, r, real=x0)
             if not math.isfinite(stats["loss"]):
@@ -684,7 +711,8 @@ def main() -> None:
                     floss, _tau = run.fake_update(z, text, r, x0_hat)
                 else:
                     x1, text1 = train_h3.load_item(rng.choice(train_items), rng, device)
-                    floss, _tau = run.fake_update(torch.randn_like(x1), text1, rng.randrange(args.iterations))
+                    r1 = (step - 1) % args.iterations if args.r_schedule == "mod" else rng.randrange(args.iterations)
+                    floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
                 fake_losses.append(float(floss.detach()))
             run.loss_scale = 1.0
             clip(fake_params, args.grad_clip)
