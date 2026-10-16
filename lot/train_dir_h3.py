@@ -48,9 +48,10 @@ Paper fidelity (appendix A). ``--paper-init`` initialises the added parameters a
 N(0, 0.02)) instead of zeros; with zeros the estimate pathway starts dead and grows at most ~lr per
 Adam step, which is why r = 4 looked like r = 1. ``--r-schedule mod`` trains iteration
 ``r = step mod R`` (the paper) instead of a random r per sample. ``--head-lr`` (not in the paper)
-gives the head its own learning rate. The paper's other settings are ``--betas 0 0.95``,
-``--ema 0.9999``, ``--dmd-weight paper``, ``--tau-shift beta:2.5``, ``--fake-updates 4``, ``--grad-clip 0``
-and ``--sigmas 1``.
+gives the head its own learning rate. Every default is the paper's (appendix A, Table 4):
+``--paper-init``, ``--r-schedule mod``, ``--betas 0 0.95``, ``--ema 0.9999``, ``--dmd-weight paper``,
+``--tau-shift beta:2.5``, ``--fake-updates 4``, ``--grad-clip 0``, ``--sigmas 1``, lr 1e-4. Runs before
+2026-10-16 (run 1, the Turbo arms A-C) used ``--zero-init --r-schedule random``.
 
 Fake update (``--fake-updates``, the paper does 4 per generator update): flow regression of the
 fake model on ``x_tau`` built from detached generator samples, conditioned on ``r``, in H3's
@@ -440,33 +441,37 @@ def main() -> None:
     parser.add_argument("--max-latent-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
                         help="random spatial crop cap in latent pixels (multiples of 8), e.g. 48 48")
     parser.add_argument("--steps", type=int, default=1000, help="generator updates")
-    parser.add_argument("--fake-updates", type=int, default=2,
-                        help="fake-model updates per generator update (the paper uses 4)")
+    parser.add_argument("--fake-updates", type=int, default=4,
+                        help="fake-model updates per generator update (the paper: 4)")
     parser.add_argument("--lr", type=float, default=1e-4, help="generator learning rate (LoRA, DirHead, adapter)")
     parser.add_argument("--fake-lr", type=float, default=1e-4)
-    parser.add_argument("--tau-shift", type=parse_tau, default=3.0,
-                        help="tau density: 'beta:A' (the paper: beta:2.5), float shift (3 ~ Beta(2.5, 1)), "
+    parser.add_argument("--tau-shift", type=parse_tau, default="beta:2.5",
+                        help="tau density: 'beta:A' (default beta:2.5, the paper), float shift (3 ~ Beta(2.5, 1)), "
                              "'sigmoid', or 'lognorm:S'; clamped to [0.02, 0.98]")
     parser.add_argument("--accum", type=int, default=1,
                         help="samples per generator and per fake update (gradient accumulation; the paper's batch is 256)")
-    parser.add_argument("--dmd-weight", choices=["norm", "paper"], default="norm",
-                        help="norm: grad = (x0_fake - x0_real) / mean|x0_hat - x0_real| (DMD2); "
-                             "paper: w(tau) = 1 on the velocity difference, grad = (x0_fake - x0_real) / tau")
-    parser.add_argument("--betas", type=float, nargs=2, default=[0.9, 0.999], metavar=("B1", "B2"),
-                        help="AdamW betas for both optimizers (paper: 0.0 0.95)")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clip, generator and fake (0 = off; paper: none)")
-    parser.add_argument("--ema", type=float, default=0.0,
-                        help="EMA decay of the generator's trainable params (0 = off), with warm-up "
-                             "min(D, (1+n)/(10+n)); saved as *_ema files")
+    parser.add_argument("--dmd-weight", choices=["norm", "paper"], default="paper",
+                        help="paper (default): w(tau) = 1 on the velocity difference, grad = (x0_fake - x0_real) / tau; "
+                             "norm: grad = (x0_fake - x0_real) / mean|x0_hat - x0_real| (DMD2)")
+    parser.add_argument("--betas", type=float, nargs=2, default=[0.0, 0.95], metavar=("B1", "B2"),
+                        help="AdamW betas for both optimizers (default 0.0 0.95, the paper)")
+    parser.add_argument("--grad-clip", type=float, default=0.0, help="gradient-norm clip, generator and fake (default 0 = off, the paper)")
+    parser.add_argument("--ema", type=float, default=0.9999,
+                        help="EMA decay of the generator's trainable params (default 0.9999, the paper; 0 = off, e.g. rank "
+                             "128 on 24 GB), with warm-up min(D, (1+n)/(10+n)); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
     parser.add_argument("--sigmas", default="1",
                         help="flow sigma per iteration: 1 (the paper: pinned), grid[:SHIFT] (H3's Euler grid, shift 12; any "
                              "init), turbo[:SHIFT] (shift 6, with a Turbo --init), or R comma values; see dir_h3")
-    parser.add_argument("--paper-init", action="store_true",
-                        help="the paper's init of the added params: Xavier x0_proj (no bias), r_embed and fake_r_embed "
-                             "~ N(0, 0.02); default zeros (step 0 == base). Ignored for files loaded by --init/--resume")
-    parser.add_argument("--r-schedule", choices=["random", "mod"], default="random",
-                        help="iteration trained each step: random per sample, or step mod R for the whole step (the paper)")
+    init = parser.add_mutually_exclusive_group()
+    init.add_argument("--paper-init", dest="paper_init", action="store_true", default=True,
+                      help="(default) the paper's init of the added params: Xavier x0_proj (no bias), r_embed and "
+                           "fake_r_embed ~ N(0, 0.02). Ignored for files loaded by --init/--resume")
+    init.add_argument("--zero-init", dest="paper_init", action="store_false",
+                      help="zero-init the added params instead (step 0 == base; runs before 2026-10-16). The estimate "
+                           "pathway then starts dead and grows ~lr per Adam step")
+    parser.add_argument("--r-schedule", choices=["mod", "random"], default="mod",
+                        help="iteration trained each step: step mod R for the whole step (default, the paper), or random per sample")
     parser.add_argument("--head-lr", type=float, default=None,
                         help="learning rate of DirHead (x0_proj, r_embed); default --lr. Not in the paper")
     parser.add_argument("--priming-weight", type=float, default=0.0,

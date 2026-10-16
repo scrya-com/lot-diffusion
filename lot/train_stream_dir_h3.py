@@ -237,9 +237,9 @@ def main() -> None:
     parser.add_argument("--tau-shift", type=parse_tau, default="beta:2.5")
     parser.add_argument("--accum", type=int, default=1)
     parser.add_argument("--dmd-weight", choices=["norm", "paper"], default="paper")
-    parser.add_argument("--betas", type=float, nargs=2, default=[0.9, 0.95], metavar=("B1", "B2"))
+    parser.add_argument("--betas", type=float, nargs=2, default=[0.0, 0.95], metavar=("B1", "B2"))   # the paper
     parser.add_argument("--grad-clip", type=float, default=0.0)
-    parser.add_argument("--ema", type=float, default=0.999)
+    parser.add_argument("--ema", type=float, default=0.9999)   # the paper
     parser.add_argument("--rank", type=int, default=16, help="LoRA rank without --init (else the init run's)")
     parser.add_argument("--swap", type=int, default=4)
     parser.add_argument("--holdout", type=int, default=8)

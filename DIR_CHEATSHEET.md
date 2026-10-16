@@ -83,25 +83,37 @@ Dry pass first. It runs one generator update and one fake update with gradients,
 python3 lot/train_dir_h3.py --check --cache my_cache --swap 4 --max-latent-hw 48 48
 ```
 
-Every line must end `ok=1`. Then train with run 1's recipe, which is the paper's recipe adapted to batch 2:
+Every line must end `ok=1`. Then train. **Every default is the paper's recipe** (appendix A, Table 4), so only the H3 and budget settings need flags:
 
 ```bash
 LOT_H3_TRAIN=1 setsid nohup python3 lot/train_dir_h3.py --cache my_cache \
-  --swap 4 --max-latent-hw 48 48 --dmd-weight paper --betas 0.9 0.95 --grad-clip 0 \
-  --fake-updates 4 --tau-shift beta:2.5 --accum 2 --ema 0.999 \
+  --swap 4 --max-latent-hw 48 48 --accum 2 \
   --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/my_dir > /tmp/my_dir.log 2>&1 &
 ```
 
-| Flag | Run 1 | Why |
+| Setting | Default (the paper) | Run 1 and Turbo arms A–C (before 2026-10-16) |
 |---|---|---|
-| `--dmd-weight paper` | on | w(τ) = 1: `grad = (x0_fake − x0_real)/τ`, the paper's final setting |
-| `--tau-shift beta:2.5` | on | τ ~ Beta(2.5, 1), the paper's importance sampling |
-| `--fake-updates 4` | 4 | fake-model updates per generator update, as in the paper |
-| `--betas 0.9 0.95` | from step 800 | paper uses β1 = 0 at batch 256; batch 2 needs momentum |
-| `--accum 2` | 2 | samples per update (H3 runs one sample at a time) |
-| `--ema 0.999` | on | averaged generator with warm-up; saved as `*_ema` |
+| Added-parameter init | `--paper-init`: Xavier `x0_proj`, no bias; `r_embed`, `fake_r_embed` ~ N(0, 0.02) | `--zero-init` (step 0 == H3; the estimate pathway starts dead, so r = 4 ≈ r = 1) |
+| Iteration trained per step | `--r-schedule mod` (`r = step mod R`) | `random` |
+| Adam betas | `--betas 0 0.95` (β1 = 0 helped at every NFE, Table 1c) | `0.9 0.95` |
+| EMA | `--ema 0.9999`, with warm-up, saved as `*_ema` | `0.999` (run 1), `0` (Turbo arms) |
+| DMD weight | `--dmd-weight paper`: w(τ) = 1, `grad = (x0_fake − x0_real)/τ` | same |
+| τ density | `--tau-shift beta:2.5` | same |
+| Fake updates per generator update | `--fake-updates 4` | same |
+| Gradient clip | `--grad-clip 0` (off) | same |
+| Flow time | `--sigmas 1` (t = 1 for every iteration) | same |
+| Learning rates | `--lr 1e-4`, `--fake-lr 1e-4` | same |
+
+Not paper settings, chosen for H3 on one card:
+
+| Flag | Value | Why |
+|---|---|---|
+| `--accum 2` | 2 | samples per update; H3 runs one sample at a time (the paper's batch is 256) |
 | `--max-latent-hw 48 48` | on | 768×768 crops keep the step at about 20.5 GB |
-| `--rank` | 16 | LoRA rank for generator and fake model; a rank-64 fake is the next experiment |
+| `--rank` | 16 (128 with the Turbo init) | LoRA instead of the paper's full fine-tune |
+| `--head-lr` | = `--lr` | optional: a higher learning rate for `x0_proj` / `r_embed` to make up for the smaller budget |
+
+**Resuming or reproducing an older run:** pass its old settings explicitly (from its `config.json`), e.g. run 1 used `--zero-init --r-schedule random --betas 0.9 0.95 --ema 0.999`. `--resume-step` loads the saved head, so the init flag doesn't matter there.
 
 **Cost:** about 65 s per step on the 24 GB card, so 1,000 steps take about 18 h.
 
@@ -124,8 +136,7 @@ grep '"eval"' lot/runs/my_dir/log.jsonl | tail -2      # held-out gap to the rea
 hf download lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors --local-dir turbo
 python3 lot/turbo_lora.py turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors --rank 128 --out lot/runs/turbo4_init
 LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 128 --fake-rank 64 --swap 12 --ema 0 \
-  --max-latent-hw 48 48 --dmd-weight paper --betas 0.9 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 --accum 2 \
-  --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo
+  --max-latent-hw 48 48 --accum 2 --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo
 ```
 
 - **What converts exactly:** out_proj, fc1 and fc2.
@@ -133,24 +144,11 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
 - **What is dropped:** the 2 token-refiner blocks.
 - **Memory:** rank 128 on a 24 GB card needs `--swap 12` and `--ema 0`. The `--check` peak is about 20.5 GB before optimizer state. `--fake-rank` keeps the fake model smaller.
 
-### Faithful to the paper: `--paper-init`, `--r-schedule mod`, `--betas 0 0.95`
+### Why the paper's init matters (r = 4 ≈ r = 1 before)
 
-In every run up to run D, r = 4 looked like r = 1 ([dir-diffusion#2](https://github.com/scrya-com/dir-diffusion/issues/2)). The main cause was ours, not the paper's: we initialised the added parameters at **zero** (so step 0 equals H3 exactly). The previous estimate's only path, `DirHead.x0_proj`, then starts dead and grows at most about one learning rate per Adam step. The paper (appendix A) does it differently:
+In every run before run D, r = 4 looked like r = 1 ([dir-diffusion#2](https://github.com/scrya-com/dir-diffusion/issues/2)). The main cause was ours, not the paper's: we initialised the added parameters at **zero** (now `--zero-init`), so that step 0 equals H3 exactly. The previous estimate's only path, `DirHead.x0_proj`, then starts dead and grows at most about one learning rate per Adam step. The paper initialises it like SiT's input projection (Xavier, no bias) and the r embeddings from N(0, 0.02). That's now the default (`--paper-init`), together with the paper's `--r-schedule mod` and `--betas 0 0.95`. The table in section 4 lists every default.
 
-| Paper (appendix A, Table 4) | Flag | Default here |
-|---|---|---|
-| `x0` projection initialised like SiT's input projection (Xavier), **no bias** | `--paper-init` | zeros (step 0 == H3) |
-| `r` embedding (generator and fake) ~ N(0, 0.02) | `--paper-init` | zeros |
-| `r = step mod R` | `--r-schedule mod` | random per sample |
-| Adam (0.0, 0.95); β1 = 0 helped at every NFE | `--betas 0 0.95` | (0.9, 0.999) |
-| flow time fixed at t = 1 | `--sigmas 1` | `1` |
-| EMA 0.9999 | `--ema 0.9999` | off (doesn't fit at rank 128 on 24 GB) |
-
-```bash
-LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 128 --fake-rank 64 --swap 12 --ema 0 \
-  --max-latent-hw 48 48 --dmd-weight paper --betas 0 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 --accum 2 \
-  --sigmas 1 --paper-init --r-schedule mod --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_paper
-```
+With the Turbo init on 24 GB, rank 128 still needs `--ema 0`.
 
 - **`--head-lr`** (not in the paper) gives `x0_proj` and `r_embed` their own learning rate. It compensates for our budget: LoRA at batch 2 for about 1,000 steps, against the paper's full fine-tune at batch 256 for 40 epochs.
 - **`--paper-init` only touches parameters that aren't loaded.** A `--init` run with a `dir_head.pt`, or a `--resume-step`, keeps its saved values. The Turbo init has no head, so it gets the paper init.
@@ -175,8 +173,7 @@ python3 lot/render_dir_h3.py --run lot/runs/turbo4_init_run --sigmas turbo --den
   --prompts 3 --swap 8 --size 768 1152 --out lot/runs/render_turbo_s0_sig
 # train with it (the Turbo warm start above, plus --sigmas)
 LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 128 --fake-rank 64 --swap 12 --ema 0 \
-  --max-latent-hw 48 48 --dmd-weight paper --betas 0.9 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 --accum 2 \
-  --sigmas turbo --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo_sig
+  --max-latent-hw 48 48 --accum 2 --sigmas turbo --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo_sig
 ```
 
 - **Step-0 result** (Turbo init, untrained): the held-out gap goes 0.217, 0.193, 0.175, 0.160 across r = 1 to 4. With pinned σ it's 0.217 at every r. The untrained r = 4 already beats every trained pinned-σ run, and it has Turbo's wide framing.

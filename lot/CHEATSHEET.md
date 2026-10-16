@@ -180,12 +180,15 @@ python3 lot/render_dir_h3.py --untrained --prompts 1             # smoke: zero h
 
 | `train_dir_h3.py` flag | Default | What it does |
 |---|---|---|
-| `--dmd-weight {norm,paper}` | `norm` | `norm`: DMD2 normaliser 1 over the mean absolute gap of x0_hat to x0_real. `paper`: w(τ) = 1, `grad = (x0_fake - x0_real)/τ`. |
-| `--betas B1 B2` | `0.9 0.999` | AdamW betas, both optimizers (paper: `0.0 0.95`). |
-| `--grad-clip` | `1.0` | Gradient-norm clip, generator and fake; `0` = off (paper: none). |
-| `--ema D` | `0` (off) | EMA of the generator's trainable params, warm-up decay `min(D, (1+n)/(10+n))` (~n/10-step window until it reaches D); writes `*_ema` files next to the normal ones. Resuming a run saved without warm-up restarts the average from the live weights. |
+| `--dmd-weight {paper,norm}` | `paper` | `paper`: w(τ) = 1, `grad = (x0_fake - x0_real)/τ`. `norm`: DMD2 normaliser 1 over the mean absolute gap of x0_hat to x0_real. |
+| `--betas B1 B2` | `0.0 0.95` (paper) | AdamW betas, both optimizers. |
+| `--grad-clip` | `0` (off, paper) | Gradient-norm clip, generator and fake. |
+| `--ema D` | `0.9999` (paper) | EMA of the generator's trainable params, warm-up decay `min(D, (1+n)/(10+n))` (~n/10-step window until it reaches D); writes `*_ema` files next to the normal ones. `0` = off (rank 128 on 24 GB). Resuming a run saved without warm-up restarts the average from the live weights. |
+| `--paper-init` / `--zero-init` | `--paper-init` (paper) | Xavier `x0_proj` (no bias), r embeddings ~ N(0, 0.02); `--zero-init` makes step 0 equal H3 (runs before 2026-10-16). |
+| `--r-schedule {mod,random}` | `mod` (paper) | `r = step mod R`, or random per sample. |
+| `--fake-updates`, `--tau-shift` | `4`, `beta:2.5` (paper) | Fake updates per generator update; DMD τ ~ Beta(2.5, 1). |
 
-Paper-style: `--dmd-weight paper --betas 0 0.95 --grad-clip 0 --ema 0.999 --fake-updates 4`.
+All defaults are the paper's (appendix A, Table 4); see `DIR_CHEATSHEET.md` for the full table and the settings older runs used.
 
 `meta.json` has DiT ms per sample and `delta[r] = mean |x̂0⁽ʳ⁾ − x̂0⁽ʳ⁻¹⁾|` per prompt.
 
