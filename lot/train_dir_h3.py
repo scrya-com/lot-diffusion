@@ -86,7 +86,8 @@ from lot_paths import LOT_H3_STILLS_CACHE  # noqa: E402
 
 import train_h3  # noqa: E402
 from dir_h3 import (DEFAULT_R, DirFakeHead, DirHead, fake_velocity, fake_x0, generator_step,  # noqa: E402
-                    parse_layout_schedule, probe_temb_dim, real_x0, save_dir_run, use_networks)
+                    next_state, parse_layout_schedule, parse_sigmas, probe_temb_dim, real_x0, save_dir_run,
+                    use_networks)
 from h3_musubi import sample_sigma  # noqa: E402
 from h3_splice import LotSplice  # noqa: E402
 
@@ -103,6 +104,7 @@ class Run:
         self.gen_net, self.fake_net, self.adapter = gen_net, fake_net, adapter
         self.args, self.device = args, device
         self.iterations = args.iterations
+        self.sigmas = parse_sigmas(args.sigmas, args.iterations)
         self.loss_scale = 1.0       # 1 / --accum while accumulating; backward() scales by it
         self._schedules: dict = {}
         # Priming references draw from their own stream so the global torch RNG (z, tau, eps) is
@@ -123,22 +125,24 @@ class Run:
     def audio(self, seed):
         return torch.Generator(self.device).manual_seed(seed)
 
-    def one_step(self, z, estimate, r, text, schedule, audio_seed):
-        """One iteration. The silent-audio noise is part of ``z``'s conditioning, so every call of
-        one sample (all rollout iterations and the grad re-forward) gets a FRESH generator with the
-        SAME ``audio_seed``: identical audio noise at every iteration."""
+    def one_step(self, state, estimate, r, text, schedule, audio_seed):
+        """One iteration from the iteration state (``z`` itself with the default all-ones sigmas).
+        The silent-audio noise is part of ``z``'s conditioning, so every call of one sample (all
+        rollout iterations and the grad re-forward) gets a FRESH generator with the SAME
+        ``audio_seed``: identical audio noise at every iteration."""
         audio = torch.Generator(self.device).manual_seed(audio_seed)
-        return generator_step(self.dit, self.head, z, estimate, r, text, splice=self.splice(schedule[r]),
-                              audio_generator=audio)
+        return generator_step(self.dit, self.head, state, estimate, r, text, splice=self.splice(schedule[r]),
+                              sigma=self.sigmas[r], audio_generator=audio)
 
     @torch.no_grad()
-    def rollout(self, z, r, text, schedule, audio_seed) -> torch.Tensor:
-        """``x0_hat[r]`` (zeros for r = 0), generator on, fake off, no grad."""
-        estimate = torch.zeros_like(z)
+    def rollout(self, z, r, text, schedule, audio_seed) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(state x_r, x0_hat[r])`` (``(z, zeros)`` for r = 0), generator on, fake off, no grad."""
+        estimate, state = torch.zeros_like(z), z
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             for k in range(r):
-                estimate = self.one_step(z, estimate, k, text, schedule, audio_seed)
-        return estimate
+                estimate = self.one_step(state, estimate, k, text, schedule, audio_seed)
+                state = next_state(state, estimate, self.sigmas[k], self.sigmas[k + 1])
+        return state, estimate
 
     def draw_tau(self) -> float:
         dist = self.args.tau_shift
@@ -158,9 +162,9 @@ class Run:
         for _ in range(self.args.priming_refs):
             z_ref = torch.randn(x0_hat.shape, generator=self.prime_rng).to(x0_hat.device, x0_hat.dtype)
             seed = int(torch.randint(0, 2**31 - 1, (1,), generator=self.prime_rng))
-            prev = self.rollout(z_ref, r, text, schedule, seed)
+            state, prev = self.rollout(z_ref, r, text, schedule, seed)
             with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
-                refs.append(self.one_step(z_ref, prev, r, text, schedule, seed))
+                refs.append(self.one_step(state, prev, r, text, schedule, seed))
         cross = (x0_hat - real).pow(2).mean()
         self_term = sum((x0_hat - ref).pow(2).mean() for ref in refs) / len(refs)
         s2 = (0.5 * (cross + self_term)).clamp(min=1e-6)
@@ -180,9 +184,9 @@ class Run:
         """
         schedule = self.schedule(z)
         seed = int(torch.randint(0, 2**31 - 1, (1,)))
-        estimate = self.rollout(z, r, text, schedule, seed)
+        state, estimate = self.rollout(z, r, text, schedule, seed)
         with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
-            x0_hat = self.one_step(z, estimate, r, text, schedule, seed)
+            x0_hat = self.one_step(state, estimate, r, text, schedule, seed)
         tau = self.draw_tau()
         eps = torch.randn_like(z)
         x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
@@ -213,7 +217,7 @@ class Run:
                 grad_prime, prime_stats = self.priming_grad(x0_hat, real, r, text, schedule)
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             with torch.enable_grad():
-                x0_hat_g = self.one_step(z, estimate, r, text, schedule, seed)
+                x0_hat_g = self.one_step(state, estimate, r, text, schedule, seed)
                 dmd = 0.5 * F.mse_loss(x0_hat_g, (x0_hat_g.detach() - grad))   # d/dx0_hat_g = grad / N
                 loss = dmd
                 ot = prime = None
@@ -242,8 +246,8 @@ class Run:
             schedule = self.schedule(z)
             seed = int(torch.randint(0, 2**31 - 1, (1,)))
             with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
-                prev = self.rollout(z, r, text, schedule, seed)
-                x0_hat = self.one_step(z, prev, r, text, schedule, seed)
+                state, prev = self.rollout(z, r, text, schedule, seed)
+                x0_hat = self.one_step(state, prev, r, text, schedule, seed)
         tau = self.draw_tau()
         eps = torch.randn_like(z)
         x_tau = (1.0 - tau) * x0_hat + tau * eps
@@ -442,6 +446,9 @@ def main() -> None:
                         help="EMA decay of the generator's trainable params (0 = off), with warm-up "
                              "min(D, (1+n)/(10+n)); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
+    parser.add_argument("--sigmas", default="1",
+                        help="flow sigma per iteration: 1 (the paper: pinned), grid[:SHIFT] (H3's Euler grid, shift 12; any "
+                             "init), turbo[:SHIFT] (shift 6, with a Turbo --init), or R comma values; see dir_h3")
     parser.add_argument("--priming-weight", type=float, default=0.0,
                         help="Priming Models' real-data term in latent space (arXiv 2610.20331; 0 = off), see docstring")
     parser.add_argument("--priming-refs", type=int, default=1,
@@ -575,7 +582,7 @@ def main() -> None:
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
-          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} "
+          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} sigmas={args.sigmas} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -591,7 +598,7 @@ def main() -> None:
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
-            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs}
+            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
@@ -617,10 +624,12 @@ def main() -> None:
             z = torch.randn(x0.shape, device=device, generator=gen)
             eps = torch.randn(x0.shape, device=device, generator=gen)
             schedule = run.schedule(z)
-            estimate = torch.zeros_like(z)
+            estimate, state = torch.zeros_like(z), z
             for r in range(args.iterations):
                 with use_networks(gen_net, fake_net, gen=True, fake=False):
-                    new = run.one_step(z, estimate, r, text, schedule, 7 * index)
+                    new = run.one_step(state, estimate, r, text, schedule, 7 * index)
+                if r + 1 < args.iterations:
+                    state = next_state(state, new, run.sigmas[r], run.sigmas[r + 1])
                 change[r].append(float((new - estimate).pow(2).mean().sqrt()))
                 tau = 0.6
                 x_tau = (1.0 - tau) * new + tau * eps

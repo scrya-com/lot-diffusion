@@ -96,6 +96,10 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=None, help="R (default: config.json iters, else 4)")
     parser.add_argument("--schedule", default=None,
                         help="layout per iteration, e.g. bands,bands,dense,dense (default: config.json, else dense)")
+    parser.add_argument("--sigmas", default=None,
+                        help="flow sigma per iteration: 1, grid[:SHIFT], turbo[:SHIFT] or a comma list (default: config.json sigmas, else 1)")
+    parser.add_argument("--dense-from", type=Path, default=None,
+                        help="reuse the dense column of an earlier render (same prompts, seed, canvas, steps) instead of sampling it")
     parser.add_argument("--steps", type=int, default=20, help="dense baseline steps")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "render_dir")
@@ -116,7 +120,7 @@ def main() -> None:
         WIDTH, HEIGHT = args.size
 
     refuse_if_busy("render_dir_h3.py")
-    from dir_h3 import DirHead, dir_sample, parse_layout_schedule, probe_temb_dim, use_networks
+    from dir_h3 import DirHead, dir_sample, parse_layout_schedule, parse_sigmas, probe_temb_dim, use_networks
     from h3 import make_h3_adapter
     from h3_musubi import load_dit, load_vae, sample
 
@@ -127,6 +131,9 @@ def main() -> None:
         raise SystemExit(f"--iters {iters} is outside 1..{trained_iters}: the run trained {trained_iters} iteration embeddings")
     spec = args.schedule or config.get("schedule") or "dense"
     schedule = parse_layout_schedule(spec, iters, HEIGHT // 32, WIDTH // 32, 1)
+    # a run's sigmas cover its trained R; rendering fewer iterations uses the first ones
+    sigmas = parse_sigmas(args.sigmas or config.get("sigmas") or "1",
+                          trained_iters if args.run is not None else iters)[:iters]
 
     if args.run is not None and any(n.strip() != "dense" for n in spec.split(",")) \
             and not ((args.run / "adapter.pt").is_file() or (args.run / "adapter.safetensors").is_file()):
@@ -159,6 +166,14 @@ def main() -> None:
         if args.pick:
             held = [held[int(index)] for index in args.pick.split(",")]
     prompts = load_prompts(args.prompts, held)
+    if args.dense_from is not None:
+        old = json.loads((args.dense_from / "meta.json").read_text())
+        want = {"prompts": [text for text, _ in prompts][:len(old["prompts"])], "seed": args.seed,
+                "canvas": f"{WIDTH}x{HEIGHT}", "steps": args.steps}
+        have = {"prompts": old["prompts"][:len(prompts)], "seed": old["seed"], "canvas": old["canvas"],
+                "steps": old.get("steps", 20)}
+        if want != have or len(old["prompts"]) < len(prompts):
+            raise SystemExit(f"--dense-from {args.dense_from}: prompts/seed/canvas/steps differ")
 
     latents: dict[tuple[int, str], torch.Tensor] = {}
     dense_ms, dir_ms, deltas = [], [], []
@@ -167,16 +182,19 @@ def main() -> None:
         seed = args.seed + index
         torch.cuda.synchronize()
         start = time.perf_counter()
-        with torch.inference_mode(), use_networks(network, None, gen=False, fake=False):
-            dense = sample(model, embeds, width=WIDTH, height=HEIGHT, steps=args.steps, seed=seed)
-        torch.cuda.synchronize()
-        dense_ms.append(1000 * (time.perf_counter() - start))
-        latents[(index, "dense20")] = dense.float().cpu()
+        if args.dense_from is None:
+            with torch.inference_mode(), use_networks(network, None, gen=False, fake=False):
+                dense = sample(model, embeds, width=WIDTH, height=HEIGHT, steps=args.steps, seed=seed)
+            torch.cuda.synchronize()
+            dense_ms.append(1000 * (time.perf_counter() - start))
+            latents[(index, "dense20")] = dense.float().cpu()
+        else:
+            dense_ms.append(float(old["dit_ms"]["dense"][index]))
 
         start = time.perf_counter()
         with torch.inference_mode(), use_networks(network, None, gen=True, fake=False):
             _final, estimates = dir_sample(model, head, embeds, height=HEIGHT, width=WIDTH, iters=iters,
-                                           seed=seed, schedule=schedule, adapter=adapter)
+                                           seed=seed, schedule=schedule, adapter=adapter, sigmas=sigmas)
         torch.cuda.synchronize()
         dir_ms.append(1000 * (time.perf_counter() - start))
         previous = torch.zeros_like(estimates[0])
@@ -200,8 +218,13 @@ def main() -> None:
     for index in range(len(prompts)):
         row = []
         for name in names:
-            with torch.inference_mode():
-                image = to_image(decoder.decode(latents[(index, name)].to("cuda", next(decoder.parameters()).dtype)))
+            if name == "dense20" and args.dense_from is not None:
+                from PIL import Image
+
+                image = Image.open(args.dense_from / f"p{index}_dense20.png").convert("RGB")
+            else:
+                with torch.inference_mode():
+                    image = to_image(decoder.decode(latents[(index, name)].to("cuda", next(decoder.parameters()).dtype)))
             image.save(args.out / f"p{index}_{name}.png")
             row.append(image)
         rows.append(row)
@@ -211,7 +234,8 @@ def main() -> None:
     grid(rows, labels).save(args.out / "grid.png")
     meta = {
         "run": None if args.run is None else str(args.run), "untrained": bool(args.untrained), "ema": bool(args.ema),
-        "iters": iters, "schedule": spec, "steps": args.steps, "seed": args.seed, "canvas": f"{WIDTH}x{HEIGHT}",
+        "iters": iters, "schedule": spec, "sigmas": sigmas,
+        "dense_from": None if args.dense_from is None else str(args.dense_from), "steps": args.steps, "seed": args.seed, "canvas": f"{WIDTH}x{HEIGHT}",
         "prompts": [text for text, _ in prompts],
         "dit_ms": {"dense": dense_ms, "dir_total": dir_ms, "dense_median": dense_med, "dir_median": dir_med,
                    "dir_per_iter_median": dir_med / iters,

@@ -828,6 +828,50 @@ def test_dir_use_networks_restores():
 
 # ------------------------------------------------------------------------- streaming DiR
 
+def test_dir_sigma_schedule_is_euler():
+    """Zero head: all-ones sigmas keep the paper's pinned DiR (state = z); a schedule below 1 is
+    H3's deterministic Euler sampler on that grid from the same z (Turbo's grid primes DiR)."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_dir_sigma_schedule_is_euler: musubi_tuner not importable", flush=True)
+        return
+    from dir_h3 import DirHead, dir_sample, generator_step, parse_sigmas, probe_temb_dim
+    from h3_musubi import forward_video, shift_sigma
+
+    head = DirHead(dit.config.hidden_size, probe_temb_dim(dit), 4)
+    text = torch.randn(1, 5, 16)
+    with torch.no_grad():
+        _, pinned = dir_sample(dit, head, text, height=64, width=96, seed=3, device="cpu")
+        z = torch.randn(1, 24, 1, 4, 6, generator=torch.Generator("cpu").manual_seed(3))
+        estimate = torch.zeros_like(z)
+        for r in range(4):
+            estimate = generator_step(dit, head, z, estimate, r, text,
+                                      audio_generator=torch.Generator("cpu").manual_seed(4))
+            assert float((pinned[r] - estimate).abs().max()) < 1e-5, r
+
+        sigmas = parse_sigmas("turbo", 4)
+        q = torch.linspace(1.0, 0.0, 5, dtype=torch.float64)
+        assert all(abs(a - float(shift_sigma(b, 6.0))) < 1e-12 for a, b in zip(sigmas, q))
+        assert parse_sigmas("grid:6", 4) == sigmas and parse_sigmas("grid", 4)[1] == float(shift_sigma(q[1], 12.0))
+        _, iterated = dir_sample(dit, head, text, height=64, width=96, seed=3, sigmas=sigmas, device="cpu")
+        x = z.clone()
+        for r, sigma in enumerate(sigmas + [0.0]):
+            if r == 4:
+                break
+            out = forward_video(dit, x, 1.0 - sigma, text, audio_generator=torch.Generator("cpu").manual_seed(4)).float()
+            x0 = x + sigma * out
+            assert float((iterated[r] - x0).abs().max()) < 1e-4, r
+            ratio = (sigmas + [0.0])[r + 1] / sigma
+            x = ratio * x + (1.0 - ratio) * x0
+        assert float((iterated[3] - pinned[3]).abs().max()) > 1e-3     # the schedule changes the result
+    for bad in ("0.5,0.4,0.3,0.2", "1,0.5", "1,0.5,0.7,0.2"):
+        try:
+            parse_sigmas(bad, 4)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
 def _tiny_h3():
     """A 2-layer, 64-wide MiniMax-H3 on the CPU in fp32 (random weights), or None without musubi."""
     if _musubi() is None:
@@ -1114,6 +1158,7 @@ def main():
         test_dir_video_modulation_rewrite,
         test_dir_use_networks_restores,
         test_dir_ema_warmup,
+        test_dir_sigma_schedule_is_euler,
         test_stream_layout_and_positions_match_stock,
         test_stream_frame_modulation_rewrite,
         test_stream_forward_matches_stock_h3,

@@ -17,6 +17,16 @@ changed minimally:
   ``h3_musubi.video_modulation_rewrite``);
 * the flow time is pinned to the noise end: H3 ``model_t_video = 0`` (sigma = 1).
 
+Optional sigma schedule (``parse_sigmas``; default all 1, the paper's DiR). With ``sigmas``
+below 1, iteration ``r`` sees the deterministic Euler state ``x_r`` instead of ``z`` at flow time
+``sigma_r``, ``x0_hat[r+1] = x_r + sigma_r * out``, and ``x_{r+1} = (s_{r+1}/s_r) x_r +
+(1 - s_{r+1}/s_r) x0_hat[r+1]``, still from ONE ``z`` and no renoising. All-ones keeps ``x_r = z``
+(identical to the pinned form). A grid primes the iterations for any init: with a zero head the
+generator IS its LoRA's R-step Euler sampler at step 0 (base H3's with no LoRA, ``grid``, shift 12;
+Minimax-H3-Turbo's with the Turbo init, ``turbo``, shift 6), so later iterations refine from the
+start rather than having to learn to read ``x0_proj`` (which starts at zero and moves at most ~lr
+per Adam step).
+
 H3 head convention (this repo): the head predicts ``x0 - eps`` and the clean estimate is
 ``x_t + sigma * out``. At sigma = 1, ``x_t = z``, so ``x0_hat = z + out``. With a LoT
 layout the output is y-space velocity and ``x0_hat = splice.to_x(z + out_y)``.
@@ -135,21 +145,56 @@ def estimate_extra(head: DirHead, estimate: torch.Tensor, layout: LotLayout | No
     return head.x0_proj(tokens)
 
 
+def parse_sigmas(spec, iters: int) -> list[float]:
+    """Per-iteration flow sigma: ``1`` (the paper, pinned), ``grid`` / ``grid:SHIFT`` (H3's
+    deterministic Euler grid ``shift(linspace(1, 0, R + 1)[:R])``, default shift 12 = H3's own,
+    for any init: base H3, a DiR run, a fresh LoRA), ``turbo`` / ``turbo:SHIFT`` (the same grid
+    at Turbo's 768p shift 6), or ``R`` comma-separated values in (0, 1] starting at 1."""
+    if spec is None or str(spec) in ("1", "1.0", "pinned"):
+        return [1.0] * iters
+    if isinstance(spec, (list, tuple)):
+        values = [float(v) for v in spec]
+    elif str(spec).split(":", 1)[0] in ("grid", "turbo"):
+        from h3_musubi import VIDEO_SHIFT, shift_sigma
+
+        name, _, value = str(spec).partition(":")
+        shift = float(value) if value else (6.0 if name == "turbo" else float(VIDEO_SHIFT))
+        grid = torch.linspace(1.0, 0.0, iters + 1, dtype=torch.float64)[:iters]
+        values = [float(shift_sigma(q, shift)) for q in grid]
+    else:
+        values = [float(v) for v in str(spec).split(",")]
+    if len(values) != iters or values[0] != 1.0 or any(not 0.0 < v <= 1.0 for v in values) \
+            or any(b > a for a, b in zip(values, values[1:])):
+        raise ValueError(f"sigmas {spec!r}: need {iters} non-increasing values in (0, 1] starting at 1")
+    return values
+
+
+def next_state(state: torch.Tensor, clean: torch.Tensor, sigma: float, sigma_next: float) -> torch.Tensor:
+    """Deterministic Euler step of the iteration state (``state`` unchanged when both sigmas are 1)."""
+    if sigma_next == sigma:
+        return state
+    ratio = sigma_next / sigma
+    return ratio * state + (1.0 - ratio) * clean.to(state.dtype)
+
+
 def generator_step(dit, head: DirHead, z: torch.Tensor, estimate: torch.Tensor, r: int, text: torch.Tensor, *,
-                   splice: LotSplice | None = None,
+                   splice: LotSplice | None = None, sigma: float = 1.0,
                    audio_generator: torch.Generator | None = None) -> torch.Tensor:
     """One iteration ``x0_hat[r+1] = G(x0_hat[r], z, r)``, in x-space.
 
-    Dense: ``z + out``. LoT: ``splice.to_x(z + out_y)``, with ``z`` and ``estimate``
-    mapped into y-space for the DiT (``estimate`` is mapped by ``splice.to_y``).
+    Dense: ``z + sigma * out`` (``z`` is the iteration state ``x_r``; plain ``z`` when sigma = 1).
+    LoT (sigma 1 only): ``splice.to_x(z + out_y)``, with ``z`` and ``estimate`` mapped into
+    y-space for the DiT (``estimate`` is mapped by ``splice.to_y``).
     """
     state, previous = z, estimate
     if splice is not None:
+        if sigma != 1.0:
+            raise ValueError("a sigma schedule below 1 is dense-only")
         previous = splice.to_y(estimate)
     extra = estimate_extra(head, previous, None if splice is None else splice.layout)
-    out = forward_video(dit, state, 0.0, text, lot=splice, video_extra=extra,
+    out = forward_video(dit, state, 1.0 - sigma, text, lot=splice, video_extra=extra,
                         video_temb_delta=head.r_embed[r], audio_generator=audio_generator).float()
-    clean = state.float() + out
+    clean = state.float() + sigma * out
     return clean if splice is None else splice.to_x(clean)
 
 
@@ -222,15 +267,18 @@ def parse_layout_schedule(spec: str, iterations: int, token_h: int, token_w: int
 @torch.no_grad()
 def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: int, latent_t: int = 1,
                iters: int = DEFAULT_R, seed: int = 0, schedule: list | None = None, adapter=None,
-               device="cuda") -> tuple[torch.Tensor, list[torch.Tensor]]:
+               sigmas: list | None = None, device="cuda") -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Run ``iters`` iterations from the same noise. Returns the final x-space latent and every ``x0_hat``.
 
     ``schedule`` is the list from ``parse_layout_schedule`` (``None`` or entries ``None``: dense).
-    A non-dense entry needs ``adapter`` (a ``LotVisualAdapter``).
+    A non-dense entry needs ``adapter`` (a ``LotVisualAdapter``). ``sigmas`` from ``parse_sigmas``
+    (default: all 1).
     """
+    sigmas = sigmas or [1.0] * iters
     generator = torch.Generator(device).manual_seed(seed)
     z = torch.randn(1, 24, latent_t, height // 16, width // 16, device=device, generator=generator)
     estimate = torch.zeros_like(z)
+    state = z
     schedule = schedule or [None] * iters
     if len(schedule) < iters:
         raise ValueError(f"schedule has {len(schedule)} entries for {iters} iterations")
@@ -244,8 +292,11 @@ def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: in
             splice = LotSplice(adapter, layout, y_space=True)
         # same silent-audio noise at every iteration (a fresh generator with one seed), like z
         audio_generator = torch.Generator(device).manual_seed(seed + 1)
-        estimate = generator_step(dit, head, z, estimate, r, text, splice=splice, audio_generator=audio_generator)
+        estimate = generator_step(dit, head, state, estimate, r, text, splice=splice, sigma=sigmas[r],
+                                  audio_generator=audio_generator)
         estimates.append(estimate)
+        if r + 1 < iters:
+            state = next_state(state, estimate, sigmas[r], sigmas[r + 1])
     return estimate, estimates
 
 
