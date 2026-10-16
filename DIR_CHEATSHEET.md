@@ -133,6 +133,62 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
 - **What is dropped:** the 2 token-refiner blocks.
 - **Memory:** rank 128 on a 24 GB card needs `--swap 12` and `--ema 0`. The `--check` peak is about 20.5 GB before optimizer state. `--fake-rank` keeps the fake model smaller.
 
+### Make the iterations refine: `--sigmas` (experimental)
+
+With the paper's setup (`--sigmas 1`, the default), every iteration runs H3 at σ = 1 on the same `z`. The previous estimate only gets in through `DirHead.x0_proj`, which starts at zero and grows about one learning rate per Adam step. So r = 4 looked like r = 1 in every run so far ([dir-diffusion#2](https://github.com/scrya-com/dir-diffusion/issues/2)).
+
+`--sigmas` gives each iteration its own flow time. Iteration r runs on a deterministic Euler state built from the same `z` and its earlier estimates, still with no renoising. With a zero head, the generator at step 0 is its LoRA's own 4-step sampler, so later iterations refine from the start.
+
+| `--sigmas` | σ per iteration (R = 4) | Use with |
+|---|---|---|
+| `1` (default) | 1, 1, 1, 1 | the paper's DiR, unchanged |
+| `grid` / `grid:SHIFT` | 1, 0.973, 0.923, 0.8 (H3's shift 12) | any init: base H3, a fresh LoRA, a pinned-σ run |
+| `turbo` / `turbo:SHIFT` | 1, 0.947, 0.857, 0.667 (Turbo's 768p shift 6) | the Turbo warm start |
+| `1,0.9,0.7,0.5` | explicit, non-increasing, starting at 1 | anything |
+
+```bash
+# step 0, no training: what the schedule does to an init (reuse an earlier render's dense column)
+python3 lot/render_dir_h3.py --run lot/runs/turbo4_init_run --sigmas turbo --dense-from lot/runs/render_turbo_s0 \
+  --prompts 3 --swap 8 --size 768 1152 --out lot/runs/render_turbo_s0_sig
+# train with it (the Turbo warm start above, plus --sigmas)
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 128 --fake-rank 64 --swap 12 --ema 0 \
+  --max-latent-hw 48 48 --dmd-weight paper --betas 0.9 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 --accum 2 \
+  --sigmas turbo --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo_sig
+```
+
+- **Step-0 result** (Turbo init, untrained): the held-out gap goes 0.217, 0.193, 0.175, 0.160 across r = 1 to 4. With pinned σ it's 0.217 at every r. The untrained r = 4 already beats every trained pinned-σ run, and it has Turbo's wide framing.
+- **The run records it:** `config.json` stores `sigmas`, and `render_dir_h3.py` reads it, so renders use the run's schedule unless `--sigmas` overrides it.
+- **Dense layouts only:** a LoT `--schedule` needs `--sigmas 1`.
+- **Cost:** none in memory. DiR iterations rendered at about 7.5 s each, against 3.5 s pinned, at 768×1152. Not yet explained.
+- **Status:** whether DMD training keeps the per-iteration improvement is being tested (arm C in #2).
+- **Making a run dir for an untrained init:** copy the converted `lora_gen.safetensors` and a training run's `config.json` next to a zero `dir_head.pt`, e.g. `torch.save(DirHead(5376, 8, 4).state_dict(), 'dir_head.pt')`.
+
+### Real-data term: `--priming-weight` (experimental)
+
+After Priming Models ([arXiv 2610.20331](https://arxiv.org/abs/2610.20331); Park, Kim, Du, Chen, Han; Seoul National University and Harvard). DMD only learns from the frozen teacher. This adds their stage-2 loss, `F = D(a, y) − D(a, sg[a'])`, measured in latent space:
+- `y` is the cache item's own clean latent, one real sample per prompt.
+- `a'` are `--priming-refs` extra rollouts at the same prompt and r, run without gradients.
+
+With one live sample per prompt, the optimal-transport plan is uniform, so the gradient is closed-form:
+
+```
+s2         = 0.5 * (mean (a − y)^2 + mean_k mean (a − a'_k)^2)      # the paper's pair-RMS scale
+grad_prime = (mean_k a'_k − y) / s2                                 # added as --priming-weight * grad_prime
+```
+
+It moves every sample by the same displacement (the generator's mean toward `y`), so it doesn't collapse diversity the way plain regression to `y` would.
+
+```bash
+python3 lot/train_dir_h3.py --check ... --priming-weight 0.1     # prints grad_rms, prime_rms, weighted_ratio
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py ... --priming-weight 0.1 --priming-refs 1
+```
+
+- **Choosing the weight:** run `--check` and look at `weighted_ratio`, the weighted priming gradient over the DMD gradient. At weight 1 it's about 4.7, which swamps the teacher; 0.1 gives about 0.5.
+- **Paired A/B:** the references draw from their own random generator, so a run with the term sees exactly the same prompts, `z`, r, τ and ε as one without it.
+- **Cost:** one extra rollout per sample without gradients (r + 1 forwards), about 8–11% per step. No extra peak memory.
+- **Result so far** (20 steps, weight 0.1, pinned σ): wider framing, closer to Turbo 4-step, but one duplicated person, and a held-out gap of 0.229 against the control's 0.202. Not conclusive; details in #2.
+- **What's missing vs the paper:** their 16 + 16 samples per prompt, and DINO/SigLIP features. These need more GPU memory, e.g. an RTX 6000.
+
 ## 5. Render and compare
 
 ```bash
@@ -141,6 +197,9 @@ python3 lot/render_dir_h3.py --run lot/runs/my_dir --tag _1000 --ema --prompts 3
 ```
 
 The output is `grid.png`. Columns are dense 20-step H3, then DiR after 1, 2, 3 and 4 iterations, all from the same seed. `meta.json` holds the DiT milliseconds and how much each iteration changed the image. The prompts are held out (`--holdout` from the run's config).
+
+- **`--sigmas`** overrides the run's iteration schedule (default: the run's `config.json`, else `1`).
+- **`--dense-from DIR`** reuses an earlier render's dense 20-step column instead of sampling it again. That's about 73 s per prompt at 768×1152, most of a render. The prompts, seed, canvas and steps must match; the script checks.
 
 ## 6. Streaming video (experimental, not yet trained)
 
