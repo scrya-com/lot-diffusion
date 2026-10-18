@@ -506,6 +506,8 @@ def main() -> None:
     lot = any(n != "dense" for n in names)
     if lot and args.pairs is None:
         raise SystemExit("a non-dense --schedule needs --pairs (the frozen bank)")
+    if not lot:
+        train_h3.CROP_MULTIPLE = 2   # no LoT super-cells: keep the whole latent (H3's 768×1344 is 48×84)
 
     device = torch.device("cuda")
     torch.manual_seed(args.seed)

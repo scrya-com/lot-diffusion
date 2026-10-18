@@ -9,7 +9,9 @@
 ``.png``/``.jpg``/``.webp`` in ``--src`` that has a same-stem ``.txt`` caption.
 Clips keep their first ``--frames`` frames (17n+5: 22 -> 7 latent frames) and
 should be 24 fps; stills become one latent frame. Each picture is scaled to cover
-``--size W H`` and centre-cropped (default: centre-cropped to multiples of 32).
+``--size W H`` and centre-cropped (default: centre-cropped to multiples of 32). ``--buckets
+768x1152,1152x768`` instead picks, per item, the size whose aspect ratio is closest (H3's
+native 768p: the short side 768, as the renders), so portrait and landscape both keep their shape.
 Writes ``<stem>_<W>x<H>_minimaxh3.safetensors`` (key ``latent_...``) and merges
 the captions into ``captions.json``; then run ``text``.
 
@@ -147,7 +149,15 @@ def fit_canvas(pixels: torch.Tensor, size: tuple[int, int] | None) -> torch.Tens
     return video[:, :, top:top + target_h, left:left + target_w].unsqueeze(0)
 
 
-def build_media(src: Path, out: Path, frames: int, size: tuple[int, int] | None) -> None:
+def nearest_bucket(width: int, height: int, buckets: list[tuple[int, int]]) -> tuple[int, int]:
+    """The ``(W, H)`` bucket with the closest aspect ratio (log distance) to ``width x height``."""
+    import math
+
+    return min(buckets, key=lambda b: abs(math.log((b[0] / b[1]) / (width / height))))
+
+
+def build_media(src: Path, out: Path, frames: int, size: tuple[int, int] | None,
+                buckets: list[tuple[int, int]] | None = None) -> None:
     from safetensors.torch import save_file
 
     from gpu_guard import refuse_if_busy
@@ -171,7 +181,7 @@ def build_media(src: Path, out: Path, frames: int, size: tuple[int, int] | None)
         pixels, fps = read_media(path, frames)
         if fps is not None and abs(fps - 24.0) > 0.01:
             print(f"warn {path.name}: {fps:.3f} fps, H3 trains at 24", flush=True)
-        video = fit_canvas(pixels, size)
+        video = fit_canvas(pixels, nearest_bucket(pixels.shape[2], pixels.shape[1], buckets) if buckets else size)
         with torch.inference_mode():
             latent = vae.encode(video.to("cuda", torch.float32))[0].float().cpu()   # (24, T, h, w)
         if latent.shape[1] == 1:
@@ -227,12 +237,17 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=22, help="media: frames kept per clip (17n+5)")
     parser.add_argument("--size", type=int, nargs=2, default=None, metavar=("W", "H"),
                         help="media: cover-resize and centre-crop to W x H (multiples of 32)")
+    parser.add_argument("--buckets", type=str, default=None, metavar="WxH,WxH",
+                        help="media: per item, the closest-aspect size from this list (e.g. 768x1152,1152x768)")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     if args.phase == "media":
         if args.src is None or not args.src.is_dir():
             raise SystemExit("media needs --src DIR")
-        build_media(args.src, args.out, args.frames, tuple(args.size) if args.size else None)
+        buckets = [tuple(int(n) for n in b.lower().split("x")) for b in args.buckets.split(",")] if args.buckets else None
+        if buckets and args.size:
+            raise SystemExit("--size and --buckets are exclusive")
+        build_media(args.src, args.out, args.frames, tuple(args.size) if args.size else None, buckets)
     elif args.phase == "latents":
         build_latents(args.out)
     else:

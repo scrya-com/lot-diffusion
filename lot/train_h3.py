@@ -78,6 +78,7 @@ from layout import LotLayout, TokenRect, dense_layout, layout_from_rects  # noqa
 
 CACHE = LOT_H3_STILLS_CACHE
 SUPER = 4  # layout super-cell, in tokens: every extent tiles a 4×4 cell
+CROP_MULTIPLE = 2 * SUPER  # latent pixels per crop side; dense-only runs set 2 (one patch), e.g. 768×1344 = 48×84
 FINE = [(1, 1, 1)]
 MID = [(1, 1, 2), (1, 2, 1), (1, 2, 2)]
 COARSE = [(1, 2, 4), (1, 4, 2), (1, 4, 4), (1, 1, 4), (1, 4, 1)]
@@ -122,7 +123,7 @@ def load_item(item, rng: random.Random, device) -> tuple[torch.Tensor, torch.Ten
         mask = handle.get_tensor("attention_mask")
     if latent.ndim == 3:
         latent = latent.unsqueeze(1)                      # (24, 1, H, W)
-    step = 2 * SUPER                                       # latent pixels per super-cell
+    step = CROP_MULTIPLE                                   # latent pixels per super-cell (or patch, dense-only)
     height, width = latent.shape[-2] // step * step, latent.shape[-1] // step * step
     if MAX_LATENT_HW is not None:
         height = min(height, MAX_LATENT_HW[0] // step * step)
