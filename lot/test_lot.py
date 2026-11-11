@@ -889,6 +889,52 @@ def test_dir_sigma_schedule_is_euler():
         raise AssertionError(bad)
 
 
+def test_dir_smd_objective():
+    """--objective smd/both on the toy H3: the loss is SMD's mean_q D(v, v_T) - repel D(v, v_ref) on DiR's
+    chord velocity (recomputed by hand from the teacher), grads reach the generator head only, and no
+    fake forward is needed for smd."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_dir_smd_objective: musubi_tuner not importable", flush=True)
+        return
+    import argparse
+
+    from dir_h3 import DirFakeHead, DirHead, probe_temb_dim, real_x0
+    from train_dir_h3 import Run
+
+    temb = probe_temb_dim(dit)
+    head, fake_head = DirHead(dit.config.hidden_size, temb, 4), DirFakeHead(temb, 4)
+    head.paper_init(torch.Generator().manual_seed(1))
+    fake_head.paper_init(torch.Generator().manual_seed(2))
+    text, z = torch.randn(1, 5, 16), torch.randn(1, 24, 1, 4, 6)
+    for objective in ("smd", "both"):
+        args = argparse.Namespace(iterations=4, sigmas="1", seed=0, schedule="dense", objective=objective,
+                                  smd_queries=2, smd_shift=12.0, smd_weight=0.5, repel_weight=0.2, priming_weight=0.0,
+                                  ot_weight=0.0, dmd_weight="paper", tau_shift="beta:2.5")
+        run = Run(dit, head, fake_head, None, None, None, args, "cpu")
+        head.zero_grad(set_to_none=True)
+        fake_head.zero_grad(set_to_none=True)
+        torch.manual_seed(5)
+        loss, x0_hat, stats = run.generator_update(z, text, 1)
+        assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5 and stats["smd"] is not None, stats
+        assert (stats["dmd"] is None) == (objective == "smd") and len(stats["smd_sigma"]) == 2
+        assert all(0.0 < s < 1.0 for s in stats["smd_sigma"]) and stats["smd_sigma"] == sorted(stats["smd_sigma"], reverse=True)
+        assert float(head.x0_proj.weight.grad.abs().sum()) > 0 and fake_head.fake_r_embed.grad is None
+        # The same loss by hand from the teacher at the logged query times.
+        audio = lambda k: torch.Generator("cpu").manual_seed(k)   # noqa: E731
+        with torch.no_grad():
+            torch.manual_seed(5)
+            seed = int(torch.randint(0, 2**31 - 1, (1,)))
+            v = x0_hat - z
+            dist = lambda a, b: float(((a - b).pow(2).mean() + 1e-6).sqrt())   # noqa: E731
+            want = 0.0
+            for q, sigma_q in enumerate(stats["smd_sigma"]):
+                x_q = z + (1.0 - sigma_q) * v
+                want += dist(v, (real_x0(dit, x_q, sigma_q, text, audio_generator=audio(seed + 199 + q)) - x_q) / sigma_q) / 2
+            want -= 0.2 * dist(v, real_x0(dit, z, 1.0, text, audio_generator=audio(seed + 299)) - z)
+        assert abs(stats["smd"] - want) < 1e-3 * max(1.0, abs(want)), (stats["smd"], want)
+
+
 def _tiny_h3():
     """A 2-layer, 64-wide MiniMax-H3 on the CPU in fp32 (random weights), or None without musubi."""
     if _musubi() is None:
@@ -1184,6 +1230,7 @@ def main():
         test_stream_slide_is_exact_and_bounded,
         test_stream_head_warm_start,
         test_stream_trainer_updates_on_cpu,
+        test_dir_smd_objective,
     ]
     for test in tests:
         test()

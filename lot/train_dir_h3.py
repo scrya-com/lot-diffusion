@@ -53,6 +53,25 @@ gives the head its own learning rate. Every default is the paper's (appendix A, 
 ``--tau-shift beta:2.5``, ``--fake-updates 4``, ``--grad-clip 0``, ``--sigmas 1``, lr 1e-4. Runs before
 2026-10-16 (run 1, the Turbo arms A-C) used ``--zero-init --r-schedule random``.
 
+Teacher regression (``--objective smd|both``, default ``dmd``), after Simplified Matching
+Distillation (SMD; Zhang, Wan, Ma, Zhao, Chen, Liu, Chen, Chen; arXiv 2610.18472, Apache-2.0 code
+at github.com/zjwfufu/SMD): on-policy velocity regression to the frozen teacher, no fake model.
+DiR's iteration ``r`` is one flow segment from the state ``x_r`` (``z``, sigma 1) to ``x0_hat``:
+chord velocity ``v = (x0_hat - x_r) / sigma_r``. At ``--smd-queries`` points ``sigma_q`` (raw
+``u ~ U(0, 1)`` warped by H3's ``--smd-shift`` 12, times ``sigma_r``) on the chord,
+``x_q = x_r + (sigma_r - sigma_q) sg(v)``, the teacher's velocity ``v_T = (x0_T(x_q) - x_q) / sigma_q``
+is the target; ``v_ref = (x0_T(x_r) - x_r) / sigma_r`` (the teacher's one-shot guess from the
+state, SMD's ``segment_start`` reference for H3) is repelled:
+
+    L_smd = mean_q D(v, v_T,q) - repel * D(v, v_ref),     D(a, b) = sqrt(mean (a - b)^2 + 1e-6)
+
+(SMD's beta = 1 distance; ``--repel-weight`` 0.2 as their H3 config). At its fixed point
+``x0_T(x_q) = x0_hat`` for every ``q``: every iteration's estimate is where the teacher's flow from
+``z`` lands. SMD's Pivot (a training-only residual over the segment, a copy of the last 7 blocks)
+is not ported: too large for 24 GB. ``smd`` skips the fake model (no fake updates); ``both`` adds
+``--smd-weight`` x L_smd to DMD. Teacher cost: ``--smd-queries`` + 1 forwards per sample.
+``--warmup-steps`` ramps both learning rates linearly from 0 (SMD: 100; not in DiR).
+
 Fake update (``--fake-updates``, the paper does 4 per generator update): flow regression of the
 fake model on ``x_tau`` built from detached generator samples, conditioned on ``r``, in H3's
 ``x0 - eps`` head convention. The first one reuses the generator step's sample; the others
@@ -197,16 +216,29 @@ class Run:
         state, estimate = self.rollout(z, r, text, schedule, seed)
         with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             x0_hat = self.one_step(state, estimate, r, text, schedule, seed)
-        tau = self.draw_tau()
+        use_dmd = self.args.objective in ("dmd", "both")
+        use_smd = self.args.objective in ("smd", "both")
+        tau = self.draw_tau() if use_dmd else 0.0
         eps = torch.randn_like(z)
         x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
         with torch.no_grad():
-            with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
-                x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
-            with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
-                x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
-            gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
-            if self.args.dmd_weight == "paper":
+            smd_targets, smd_ref, smd_stats = self.smd_targets(state, x0_hat, r, text, seed) if use_smd else (None, None, {})
+        with torch.no_grad():
+            if not use_dmd:
+                x0_real = x0_fake = smd_stats.pop("x0_teacher")
+                weight, grad = 0.0, torch.zeros_like(x0_hat)
+                gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
+            else:
+                smd_stats.pop("x0_teacher", None)
+                with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
+                    x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
+                with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
+                    x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
+                gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
+        with torch.no_grad():
+            if not use_dmd:
+                pass
+            elif self.args.dmd_weight == "paper":
                 # Paper eq. 10 / Algorithm 1: L = E w(tau) sg[v_real - v_fake]^T x0_hat, so
                 # dL/dx0_hat = w(tau) (v_real - v_fake), with the paper's v = eps - x0 (target eps - x0_hat).
                 # At a fixed x_tau = (1-tau) x0 + tau eps, x0 = x_tau - tau v, hence
@@ -219,7 +251,8 @@ class Run:
                 weight = 1.0 / tau
             else:
                 weight = 1.0 / gap          # DMD2's normaliser (detached), the default
-            grad = (x0_fake - x0_real) * weight
+            if use_dmd:
+                grad = (x0_fake - x0_real) * weight
             grad_prime, prime_stats = None, {}
             if self.args.priming_weight > 0:
                 if real is None:
@@ -229,8 +262,11 @@ class Run:
             with torch.enable_grad():
                 x0_hat_g = self.one_step(state, estimate, r, text, schedule, seed)
                 dmd = 0.5 * F.mse_loss(x0_hat_g, (x0_hat_g.detach() - grad))   # d/dx0_hat_g = grad / N
-                loss = dmd
-                ot = prime = None
+                loss = dmd if use_dmd else 0.0 * dmd
+                ot = prime = smd = None
+                if use_smd:
+                    smd = self.smd_loss(x0_hat_g, state, r, smd_targets, smd_ref)
+                    loss = loss + (self.args.smd_weight if use_dmd else 1.0) * smd
                 if grad_prime is not None:
                     prime = 0.5 * F.mse_loss(x0_hat_g, (x0_hat_g.detach() - grad_prime))   # d/dx0_hat_g = grad_prime / N
                     loss = loss + self.args.priming_weight * prime
@@ -239,7 +275,8 @@ class Run:
                     loss = loss + self.args.ot_weight * ot
                 if backward:
                     (loss * self.loss_scale).backward()
-        stats = {"loss": float(loss.detach()), "dmd": float(dmd.detach()), "tau": tau, "w": float(weight),
+        stats = {"loss": float(loss.detach()), "dmd": float(dmd.detach()) if use_dmd else None, "tau": tau, "w": float(weight),
+                 "smd": None if smd is None else float(smd.detach()), **smd_stats,
                  "fake_real": float((x0_fake - x0_real).abs().mean()), "hat_real": float(gap),
                  "ot": None if ot is None else float(ot.detach()),
                  "grad_rms": float(grad.pow(2).mean().sqrt()),
@@ -248,6 +285,46 @@ class Run:
                  "hat_rms": float(x0_hat.pow(2).mean().sqrt()),
                  "match": float((x0_hat_g.detach() - x0_hat).abs().max())}
         return loss, x0_hat.detach(), stats
+
+    # ----------------------------------------------------------------- SMD teacher regression
+    def smd_sigmas(self, sigma_r: float) -> list[float]:
+        """``--smd-queries`` flow times on iteration ``r``'s segment (sigma_r -> 0): raw ``u ~ U(0, 1)``
+        warped by H3's shift (``s u / (1 + (s - 1) u)``, as SMD's H3 grid), scaled by ``sigma_r``."""
+        shift = self.args.smd_shift
+        out = []
+        for u in torch.rand(self.args.smd_queries).tolist():
+            warped = shift * u / (1.0 + (shift - 1.0) * u)
+            out.append(min(max(sigma_r * warped, TAU_MIN), sigma_r * TAU_MAX))
+        return sorted(out, reverse=True)
+
+    @torch.no_grad()
+    def smd_targets(self, state, x0_hat, r, text, seed):
+        """Teacher velocities on the chord ``state -> x0_hat`` and the segment-start reference (no grad)."""
+        sigma_r = float(self.sigmas[r])
+        v = (x0_hat - state) / sigma_r
+        targets, gaps, x0_first = [], [], None
+        with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
+            for q, sigma_q in enumerate(self.smd_sigmas(sigma_r)):
+                x_q = state + (sigma_r - sigma_q) * v
+                x0_t = real_x0(self.dit, x_q, sigma_q, text, audio_generator=self.audio(seed + 199 + q))
+                targets.append(((x0_t - x_q) / sigma_q, sigma_q))
+                gaps.append(float((x0_t - x0_hat).abs().mean()))
+                x0_first = x0_t if x0_first is None else x0_first
+            ref = None
+            if self.args.repel_weight > 0:
+                x0_r = real_x0(self.dit, state, sigma_r, text, audio_generator=self.audio(seed + 299))
+                ref = (x0_r - state) / sigma_r
+        return targets, ref, {"smd_gap": sum(gaps) / len(gaps), "smd_sigma": [round(s, 4) for _, s in targets],
+                              "x0_teacher": x0_first}
+
+    def smd_loss(self, x0_hat_g, state, r, targets, ref):
+        """``mean_q D(v, v_T,q) - repel * D(v, v_ref)`` on the chord velocity (grad through ``x0_hat_g``)."""
+        v = (x0_hat_g.float() - state.float()) / float(self.sigmas[r])
+        dist = lambda a, b: ((a - b.float()).pow(2).mean() + 1e-6).sqrt()   # noqa: E731
+        loss = sum(dist(v, target) for target, _ in targets) / len(targets)
+        if ref is not None:
+            loss = loss - self.args.repel_weight * dist(v, ref)
+        return loss
 
     # ------------------------------------------------------------------------ fake update
     def fake_update(self, z, text, r, x0_hat=None, *, backward=True):
@@ -478,6 +555,16 @@ def main() -> None:
                         help="Priming Models' real-data term in latent space (arXiv 2610.20331; 0 = off), see docstring")
     parser.add_argument("--priming-refs", type=int, default=1,
                         help="no-grad reference rollouts per sample for --priming-weight (each costs r + 1 forwards)")
+    parser.add_argument("--objective", choices=["dmd", "smd", "both"], default="dmd",
+                        help="generator loss: dmd (default, the paper), smd (SMD teacher-velocity regression, no fake "
+                             "model, arXiv 2610.18472) or both (dmd + --smd-weight x smd); see the docstring")
+    parser.add_argument("--smd-queries", type=int, default=2, help="teacher query points per sample for smd (SMD: 2)")
+    parser.add_argument("--smd-shift", type=float, default=12.0, help="flow shift warping the smd query times (H3 video: 12)")
+    parser.add_argument("--smd-weight", type=float, default=1.0, help="weight of the smd term with --objective both")
+    parser.add_argument("--repel-weight", type=float, default=0.2,
+                        help="smd: repel from the teacher's one-shot guess at the segment start (SMD's H3 config: 0.2; 0 = off)")
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                        help="linear lr warm-up from 0 over N generator steps, both optimizers (SMD: 100; the paper: none)")
     parser.add_argument("--rank", type=int, default=16, help="generator LoRA rank (and the fake's, unless --fake-rank)")
     parser.add_argument("--fake-rank", type=int, default=None, help="fake-model LoRA rank (default: --rank)")
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
@@ -616,6 +703,8 @@ def main() -> None:
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
           f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} sigmas={args.sigmas} paper_init={int(args.paper_init)} r_schedule={args.r_schedule} head_lr={args.head_lr or args.lr} "
+          f"objective={args.objective} smd_queries={args.smd_queries} smd_shift={args.smd_shift} smd_weight={args.smd_weight} "
+          f"repel={args.repel_weight} warmup={args.warmup_steps} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -632,7 +721,9 @@ def main() -> None:
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
             "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas,
-            "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr}
+            "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
+            "objective": args.objective, "smd_queries": args.smd_queries, "smd_shift": args.smd_shift,
+            "smd_weight": args.smd_weight, "repel_weight": args.repel_weight, "warmup_steps": args.warmup_steps}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
@@ -689,6 +780,11 @@ def main() -> None:
     for step in range(args.resume_step + 1, args.steps + 1):
         # One generator update = --accum samples (each its own prompt, noise, r and tau), grads
         # summed with 1/accum so the step matches a batch of that size. Batch 1 is the H3 runtime's limit.
+        if args.warmup_steps:
+            factor = min(1.0, step / args.warmup_steps)
+            for opt in (gen_opt, fake_opt):
+                for group in opt.param_groups:
+                    group["lr"] = group.setdefault("base_lr", group["lr"]) * factor
         gen_opt.zero_grad(set_to_none=True)
         samples, all_stats = [], []
         for _ in range(args.accum):
@@ -710,7 +806,7 @@ def main() -> None:
         # Fake updates: the first reuses the generator step's detached samples, the rest draw fresh
         # rollouts (Algorithm 1 draws fresh ones for every update; the reuse saves the rollouts).
         fake_losses = []
-        for k in range(args.fake_updates):
+        for k in range(args.fake_updates if args.objective != "smd" else 0):
             fake_opt.zero_grad(set_to_none=True)
             for z, text, r, x0_hat in samples:
                 run.loss_scale = 1.0 / args.accum
@@ -735,7 +831,9 @@ def main() -> None:
         log.write(json.dumps(record) + "\n")
         if step % 10 == 0 or step == args.steps:
             log.flush()
-            print(f"LOT_H3 kind=dir step={step} r={r} dmd={stats['dmd']:.4g} fake_loss={record['fake_loss']:.4f} "
+            terms = (f"dmd={stats['dmd']:.4g} " if stats["dmd"] is not None else "") + \
+                    (f"smd={stats['smd']:.4g} smd_gap={stats['smd_gap']:.4f} " if stats["smd"] is not None else "")
+            print(f"LOT_H3 kind=dir step={step} r={r} {terms}fake_loss={record['fake_loss']:.4f} "
                   f"fake_real={stats['fake_real']:.4f} hat_real={stats['hat_real']:.4f} grad_norm={record['grad_norm']:.3g} "
                   f"s_per_step={(time.perf_counter() - started) / (step - args.resume_step):.2f} "
                   f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
