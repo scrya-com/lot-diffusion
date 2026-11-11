@@ -195,7 +195,10 @@ def _box_desired(time: int, height: int, width: int, rng: random.Random) -> torc
 
 
 def _focus_desired(time: int, height: int, width: int, rng: random.Random) -> torch.Tensor:
-    """An in-focus ellipse (1×1), a 2×2 ring, coarse outside; the depth-of-field family."""
+    """An in-focus ellipse (1×1), a 2×2 ring, coarse outside. Training stand-in for depth_layout.
+
+    A measured depth map derives its layout through layout_sources.depth_layout (circle of confusion).
+    """
     from layout_sources import desired_from_levels
 
     cy, cx = rng.uniform(0.25, 0.75), rng.uniform(0.25, 0.75)

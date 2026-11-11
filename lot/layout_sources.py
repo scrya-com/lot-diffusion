@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from h3_positions import FRAME_PER_TOKEN
-from layout import LotLayout, TokenRect, area_average, layout_from_desired
+from layout import LotLayout, TokenRect, area_average, blur_radius, layout_from_desired
 
 EXTENTS = (1, 2, 4)
 
@@ -117,15 +117,47 @@ def boxes_to_mask(boxes: list[tuple[float, float, float, float]], height: int, w
     return mask
 
 
-def depth_layout(depth: torch.Tensor, latent_t: int, token_h: int, token_w: int, *,
-                 focus: float = 0.75, band: float = 0.15, background: int = 4) -> LotLayout:
-    """Depth of field: 1×1 within ``band`` of the focus depth, 2×2 within ``2*band``, coarse beyond.
+# lot/layout.py layout_from_blur. A cell may join extent b only when its circle of
+# confusion is at least this radius. Coarser extents need a larger defocus.
+_BLUR_SUPPORT = ((8, 3.0), (4, 1.0), (2, 0.2))
 
-    ``depth`` in [0, 1] with any convention (Depth Anything: brighter = nearer);
-    ``focus`` is on the same scale.
+
+def _desired_from_radius(radius: torch.Tensor, background: int) -> torch.Tensor:
+    """Blur radius -> coarsest extent each cell may join. In-focus cells stay at 1.
+
+    ``background`` is the coarsest square this caller can emit. H3's video heads stop at 4,
+    so a radius that would be an 8×8 square stays at 4.
     """
-    off = (_tokens(depth, latent_t, token_h, token_w, reduce="mean") - float(focus)).abs()
-    return layout_from_desired_any(desired_from_levels(off <= band, off <= 2 * band, background))
+    desired = torch.ones(radius.shape, dtype=torch.long)
+    for extent, support in reversed(_BLUR_SUPPORT):
+        if extent > background:
+            continue
+        desired = torch.where(radius >= support, torch.full_like(desired, extent), desired)
+    return desired
+
+
+def depth_layout(depth: torch.Tensor, latent_t: int, token_h: int, token_w: int, *,
+                 focus: float = 0.75, band: float = 0.15, background: int = 4,
+                 r_target: float = 4.0) -> LotLayout:
+    """Derived depth-of-field layout. Fine tokens on the focal plane, coarse squares on the defocus.
+
+    The radius is the circle of confusion (eqs. 21–22): ``|1/z - 1/z_focus|``, scaled so the
+    95th percentile of each latent frame equals ``r_target``. A square is kept only when every
+    cell inside it is blurred enough for that extent. ``depth`` is non-negative and on the same
+    scale as ``focus``. A Depth Anything map (brighter = nearer, typically in [0, 1]) is legal
+    when ``focus`` is read from that same map. ``band`` stays in the signature for existing
+    callers; the radius replaces that fixed band.
+    """
+    if background not in EXTENTS:
+        raise ValueError(f"background extent must be one of {EXTENTS}")
+    if focus <= 0 or r_target < 0 or band <= 0:
+        raise ValueError("focus must be positive, on the depth map's scale; r_target and band must be positive")
+    tokens = _tokens(depth, latent_t, token_h, token_w, reduce="mean")
+    if not torch.isfinite(tokens).all() or float(tokens.min()) < 0:
+        raise ValueError("depth must be finite and non-negative")
+    desired = torch.stack([_desired_from_radius(blur_radius(frame, float(focus), r_target), background)
+                           for frame in tokens])
+    return layout_from_desired_any(desired)
 
 
 def texture_scores(image: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:

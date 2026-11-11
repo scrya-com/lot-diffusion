@@ -690,11 +690,18 @@ def test_layout_sources():
     first = {(r.u, r.v) for r in moving.rects if r.t == 0 and r.extent == (1, 1, 1)}
     last = {(r.u, r.v) for r in moving.rects if r.t == 6 and r.extent == (1, 1, 1)}
     assert first and last and first != last
-    # depth: in-focus band fine, far plane coarse
-    depth = torch.linspace(0, 1, 768)[:, None].expand(768, 512)
-    dl = depth_layout(depth, 1, 24, 16, focus=1.0, band=0.15)
+    # depth of field: the near plane (bottom, focus 1) stays 1×1; the far plane goes coarse
+    depth = torch.linspace(0, 1, 768)[:, None].expand(768, 512).clone()
+    dl = depth_layout(depth, 1, 24, 16, focus=1.0)
     assert {r.extent for r in dl.rects if r.u >= 22} == {(1, 1, 1)}
     assert (1, 4, 4) in {r.extent for r in dl.rects if r.u < 8}
+    # cinematic portrait: the subject is the focal plane, the backdrop is defocused
+    portrait = torch.full((24, 16), 0.2)
+    portrait[4:20, 4:12] = 0.9
+    face = depth_layout(portrait, 1, 24, 16, focus=0.9)
+    assert {r.extent for r in face.rects if 8 <= r.u < 16 and 6 <= r.v < 10} == {(1, 1, 1)}
+    assert (1, 4, 4) in {r.extent for r in face.rects if r.u < 4 and r.v < 4}
+    assert face.count < face.dense_count
     # texture: noisy half fine, flat half coarse
     image = torch.zeros(1, 768, 512, 3)
     image[:, :, :256] = torch.rand(1, 768, 256, 3)

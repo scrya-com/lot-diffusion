@@ -140,7 +140,7 @@ LoT Apply works for any target length: the layout repeats per latent frame, and 
 |---|---|---|
 | LoT Layout from **Boxes** | inside normalised `x0,y0,x1,y1` boxes (secondary boxes → 2×2) | faces and subjects in portraits and talking heads |
 | LoT Layout from **Mask** | on a MASK, per frame when it is a batch (tracked object) | segmented subjects |
-| LoT Layout from **Depth** | near a focus depth (Depth Anything map) | depth-of-field shots |
+| LoT Layout from **Depth** | on the focal plane; the defocused background uses coarse squares (circle of confusion on a Depth Anything map) | depth-of-field shots |
 | LoT Layout from **Texture** | where an image is busy (i2v first frame, or a quick dense preview) | scenery, two-pass t2v |
 | LoT Layout **Preview** | draws the layout and logs the compression | checking a layout before sampling |
 
