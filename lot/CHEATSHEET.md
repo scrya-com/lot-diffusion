@@ -29,7 +29,7 @@ export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_in
 export LOT_H3_VAE=/path/to/minimax_h3_video_vae_fp16.safetensors
 hf download johndpope/MiniMax-H3-LoT --local-dir runs/lot_hf
 
-python3 lot/test_lot.py                                                   # 1. CPU tests -> ok 28
+python3 lot/test_lot.py                                                   # 1. CPU tests -> ok 31
 python3 lot/parity_h3.py                                                  # 2. GPU: LoT 1x1 == dense -> ok=1
 python3 lot/time_lot_h3.py --shape still --trained runs/lot_hf/run4_nikki_distill            # 3. timing
 python3 lot/time_lot_h3.py --shape clip  --trained runs/lot_hf/run4_nikki_distill            #    all resident, 21 GB
@@ -53,7 +53,7 @@ Both fit fully resident (peak 20.8 / 21.1 GB). With `--swap 4` the same clip onl
 ## 0. Does it work here?
 
 ```bash
-python3 lot/test_lot.py            # CPU, no weights -> "ok 28"
+python3 lot/test_lot.py            # CPU, no weights -> "ok 31"
 python3 lot/parity_h3.py           # GPU: LoT 1x1 == dense H3 -> rel_rms=0 ok=1
 ```
 
@@ -124,6 +124,28 @@ python3 lot/render_h3.py --trained lot/runs/my_run --prompt-cache lot/runs/cache
 python3 lot/time_lot_h3.py --shape long --swap 48   # 124-frame 768x1344 DiT timing, dense vs LoT
 python3 lot/time_decode_h3.py    # VAE decode (LoT does not speed this up)
 ```
+
+## 6. Mixed-resolution additions (MPEG-Diffusion, arXiv 2611.12069)
+
+Optional and off by default. Code: `lot/mixed_res.py` (model-agnostic) and `lot/mixed_res_h3.py` (H3).
+
+```bash
+R=lot/runs/my_run; O=lot/runs/my_mixed; C=/path/to/cache_1344x768
+python3 lot/mixed_res_h3.py fit-kv --run $R --out $O --cache $C --items 24   # ridge init of the up-maps -> up_maps.pt
+python3 lot/mixed_res_h3.py region --run $R --out $O --cache $C --items 200  # region head -> region_head.pt
+python3 lot/mixed_res_h3.py mixer  --run $R --out $O --cache $C --items 200 --dual $O/up_maps.pt  # -> mixer.pt
+python3 lot/mixed_res_h3.py render --run $R --out $O/render --prompt-cache $C \
+  --region $O/region_head.pt --dual $O/up_maps.pt --mixer $O/mixer.pt     # dense | LoT 2x2 | adaptive
+LOT_H3_TRAIN=1 python3 lot/train_h3.py --pairs $P --init $R --dual $O/up_maps.pt ...  # fine-tune the up-maps
+```
+
+| Piece | What it does | Flag |
+|---|---|---|
+| Dense K/V view | 1x1 queries see every coarse token's key/value expanded to its cells (copy + rank-16 delta), at dense RoPE positions | `--dual up_maps.pt` |
+| Region head | Linear head on block 25's video tokens; after `--switch` coarse steps the sampler uses the per-latent-frame layout it picks | `--region region_head.pt`, `--switch`, `--alpha`, `--floor` |
+| Seam mixer | 3D-conv residual on the final latent outside the 1x1 region; identity at init | `--mixer mixer.pt` |
+
+`render` decodes in a fresh process (it `exec`s `mixed_res_h3.py decode`), because the DiT does not return its VRAM inside the sampling process.
 
 ## ComfyUI (stills and video)
 

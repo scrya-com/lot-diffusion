@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import sys
+import types
 from pathlib import Path
 
 import torch
@@ -746,6 +747,142 @@ def test_layouts_any_grid():
         assert {r.extent for r in layout.rects} <= set(H3_EXTENTS)
 
 
+def _toy_attention(dim=32, heads=2, head_dim=16):
+    import torch.nn as nn
+
+    class ToyAttention(nn.Module):                      # H3's Attention layout, small
+        def __init__(self):
+            super().__init__()
+            self.num_heads, self.head_dim, self.inner_dim = heads, head_dim, heads * head_dim
+            self.qkv_proj = nn.Linear(dim, 3 * self.inner_dim, bias=False)
+            self.q_norm = nn.RMSNorm(head_dim)
+            self.k_norm = nn.RMSNorm(head_dim)
+            self.out_proj = nn.Linear(self.inner_dim, dim, bias=False)
+
+    return ToyAttention()
+
+
+def _toy_rotation(positions):
+    """H3's ``_rotation_table`` for ``(S, 3)`` positions, 2 frequencies per axis."""
+    inv_freq = 1.0 / (10000 ** (torch.arange(2, dtype=torch.float32) / 2))
+    per_axis = positions.float().unsqueeze(-1) * inv_freq
+    half = torch.cat(per_axis.unbind(dim=1), dim=-1)
+    angles = torch.cat((half, half), dim=-1)[..., :half.shape[-1]]
+    cos, sin = torch.cos(angles), torch.sin(angles)
+    return torch.stack((cos, -sin, sin, cos), dim=-1).reshape(1, positions.shape[0], 1, angles.shape[-1], 2, 2)
+
+
+def test_dual_kv_attention():
+    """MPEG-Diffusion's dense K/V view for 1x1 queries (mixed_res.dual_attention)."""
+    from layout import TokenRect, dense_layout, layout_from_rects
+    from mixed_res import DualKV, DualKVPlan, UpMaps, _rope, _sdpa, dual_attention, patched_attention
+
+    torch.manual_seed(0)
+    attn = _toy_attention()
+    prefix, time, height, width = 3, 2, 4, 4
+    grid = torch.stack(torch.meshgrid(torch.arange(time), torch.arange(height), torch.arange(width),
+                                      indexing="ij"), -1).reshape(-1, 3).float()
+    dense_pos = torch.cat([torch.stack([torch.arange(prefix).float(), torch.zeros(prefix), torch.zeros(prefix)], 1),
+                           grid + torch.tensor([10.0, 0, 0])])
+    dense_table = _toy_rotation(dense_pos)
+    # 1. a dense layout is H3's own attention
+    dense = dense_layout(time, height, width)
+    hidden = torch.randn(1, prefix + dense.count, 32)
+    maps = UpMaps(1, 16, [(1, 2, 2), (1, 2, 1)], rank=4)
+    with torch.no_grad():
+        got = dual_attention(attn, hidden, dense_table, layer=0, plan=DualKVPlan(dense), maps=maps,
+                             video_start=prefix, dense_rotation=dense_table[:, prefix:])
+        q, k, v = attn.qkv_proj(hidden).split(32, dim=-1)
+        q = attn.q_norm(q.reshape(1, -1, 2, 16)); k = attn.k_norm(k.reshape(1, -1, 2, 16)); v = v.reshape(1, -1, 2, 16)
+        want = attn.out_proj(_sdpa(_rope(q, dense_table), _rope(k, dense_table), v))
+    assert torch.allclose(got, want, atol=1e-5)
+    # 2. mixed layout, zero deltas: a 1x1 query sees each coarse token as copies at its cells
+    rects = [TokenRect(t, u, v, 1, 1, 1) for t in range(time) for u in range(2) for v in range(width)]
+    rects += [TokenRect(t, 2, v, 1, 2, 2) for t in range(time) for v in (0, 2)]
+    lot = layout_from_rects(time, height, width, rects)
+    plan = DualKVPlan(lot)
+    assert plan.fine_rows.numel() == 16 and plan.other_rows.numel() == 4
+    centers = torch.stack([torch.tensor([r.t + 10.0, r.u + (r.eh - 1) / 2, r.v + (r.ew - 1) / 2]) for r in lot.rects])
+    table = _toy_rotation(torch.cat([dense_pos[:prefix], centers]))
+    hidden = torch.randn(1, prefix + lot.count, 32)
+    with torch.no_grad():
+        got = dual_attention(attn, hidden, table, layer=0, plan=plan, maps=maps,
+                             video_start=prefix, dense_rotation=dense_table[:, prefix:])
+        q, k, v = attn.qkv_proj(hidden).split(32, dim=-1)
+        q = attn.q_norm(q.reshape(1, -1, 2, 16)); k = attn.k_norm(k.reshape(1, -1, 2, 16)); v = v.reshape(1, -1, 2, 16)
+        owner = torch.zeros(time, height, width, dtype=torch.long)
+        for index, r in enumerate(lot.rects):
+            owner[r.t, r.u:r.u + r.eh, r.v:r.v + r.ew] = prefix + index
+        cell_rows = torch.cat([torch.arange(prefix), owner.flatten()])
+        keys = _rope(k[:, cell_rows], dense_table)
+        fine = prefix + plan.fine_rows
+        want_fine = _sdpa(_rope(q, table)[:, fine], keys, v[:, cell_rows])
+        want_rest = _sdpa(_rope(q, table), _rope(k, table), v)
+        want = want_rest.clone()
+        want[:, fine] = want_fine
+        want = attn.out_proj(want)
+    assert torch.allclose(got, want, atol=1e-5)
+    # 3. the patch routes through dual_attention and is removed afterwards
+    blocks = [types.SimpleNamespace(attn=attn)]
+    with patched_attention(blocks, plan=plan, maps=maps, video_start=prefix, dense_rotation=dense_table[:, prefix:]):
+        assert torch.allclose(attn(hidden, table), got, atol=1e-5)
+    assert "forward" not in vars(attn)
+    # 4. ridge init recovers a rank-r relation
+    torch.manual_seed(1)
+    coarse = torch.randn(400, 16)
+    true_delta = torch.randn(16, 3) @ torch.randn(3, 4 * 16) * 0.3
+    cells = coarse.unsqueeze(1) + (coarse @ true_delta).reshape(400, 4, 16)
+    assert maps.fit_(0, (1, 2, 2), "k", coarse, cells, ridge=1e-6) < 1e-3
+    cache = DualKV(maps)
+    assert cache.plan(lot, "cpu") is cache.plan(lot, "cpu")
+
+
+def test_region_head_and_mixer():
+    """MPEG-Diffusion's self-selected region (mixed_res.region_*) and seam mixer."""
+    from layout import dense_layout
+    from mixed_res import (RegionHead, SeamMixer, mixer_loss, region_labels, region_layout, region_mask,
+                           scores_to_cells, token_targets)
+    from train_h3 import _tile
+
+    torch.manual_seed(0)
+    coarse = _tile(2, 24, 42, lambda *_: (1, 4, 4))
+    scores = torch.full((coarse.count,), -4.0)
+    for index, rect in enumerate(coarse.rects):
+        if rect.u >= 8 and rect.u < 16 and rect.v >= 16 and rect.v < 28:
+            scores[index] = 4.0
+    field = scores_to_cells(scores, coarse)
+    mask = region_mask(field, alpha=0.5, sigma=1.0)
+    assert mask[:, 12, 22].all() and not mask[:, 0, 0].any()
+    layout = region_layout(mask, background=4)
+    assert (layout.time, layout.height, layout.width) == (2, 24, 42)
+    fine = {(r.t, r.u, r.v) for r in layout.rects if r.extent == (1, 1, 1)}
+    assert (0, 12, 22) in fine and (1, 12, 22) in fine and (0, 0, 0) not in fine
+    assert not region_mask(torch.zeros(2, 24, 42), floor=0.5).any()           # flat video stays coarse
+    head = RegionHead(32)
+    assert torch.equal(head(torch.randn(5, 32)), torch.zeros(5))             # zero init
+    x0_dense = torch.randn(1, 24, 2, 48, 84)
+    x0_coarse = x0_dense.clone()
+    x0_coarse[..., 16:32, 32:56] += 3.0
+    labels = region_labels(x0_coarse, x0_dense, fraction=0.25)
+    assert labels[:, 8:16, 16:28].all() and labels.shape == (2, 24, 42)
+    targets = token_targets(labels, coarse)
+    assert targets.min() >= 0 and targets.max() == 1 and targets.shape == (coarse.count,)
+    mixer = SeamMixer(channels=24, width=8)
+    latent = torch.randn(1, 24, 2, 48, 84)
+    assert torch.equal(mixer(latent, layout), latent)                         # identity at init
+    assert float(mixer_loss(latent, latent, layout)) == 0.0
+    with torch.no_grad():
+        mixer.net[-1].bias.fill_(1.0)
+    moved = mixer(latent, layout)
+    inside = torch.zeros(2, 48, 84, dtype=torch.bool)
+    for r in layout.rects:
+        if r.extent == (1, 1, 1):
+            inside[r.t, 2 * r.u:2 * r.u + 2, 2 * r.v:2 * r.v + 2] = True
+    assert torch.equal(moved[0][:, inside], latent[0][:, inside])             # the 1x1 region is never touched
+    assert not torch.equal(moved, latent)
+    assert dense_layout(1, 2, 2).count == 4
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -777,6 +914,8 @@ def main():
         test_grid_layouts_any_shape,
         test_layout_sources,
         test_layouts_any_grid,
+        test_dual_kv_attention,
+        test_region_head_and_mixer,
     ]
     for test in tests:
         test()

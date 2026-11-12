@@ -399,6 +399,10 @@ def main() -> None:
                         help="random spatial crop cap in latent pixels (multiples of 8), e.g. 40 32")
     parser.add_argument("--init", type=Path, default=None,
                         help="warm-start adapter.pt + lora.safetensors from an earlier run dir")
+    parser.add_argument("--dual", type=Path, default=None,
+                        help="up_maps.pt from mixed_res_h3.py fit-kv: 1x1 queries attend to a dense K/V view "
+                             "(MPEG-Diffusion's dual-resolution attention); the maps train with --dual-lr")
+    parser.add_argument("--dual-lr", type=float, default=1e-4)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--adapter-lr", type=float, default=1e-4)
@@ -459,6 +463,14 @@ def main() -> None:
     lora_groups, _ = network.prepare_optimizer_params(args.lr)
     adapter_params = [p for name, p in adapter.named_parameters() if not name.startswith("bank.")]
     groups = lora_groups + [{"params": adapter_params, "lr": args.adapter_lr}]
+    dual = None
+    if args.dual is not None:
+        from mixed_res import DualKV
+        from mixed_res_h3 import load_maps
+
+        dual = DualKV(load_maps(args.dual, device).train().requires_grad_(True))
+        groups.append({"params": list(dual.maps.parameters()), "lr": args.dual_lr})
+        print(f"LOT_H3 kind=train_dual from={args.dual} rank={dual.maps.rank}", flush=True)
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(groups, weight_decay=0.0)
@@ -509,7 +521,7 @@ def main() -> None:
         gen = None if noise_seed is None else torch.Generator(device=device).manual_seed(noise_seed)
         noise = torch.randn(y0.shape, device=device, generator=gen)
         y_t, _ = sample_noisy(y0, sigma, noise)
-        out = predict(dit, y_t, 1.0 - sigma, text, lot=splice)
+        out = predict(dit, y_t, 1.0 - sigma, text, lot=splice, dual=dual)
         data = lot_h3_clean_loss(out, y_t, y0, sigma)
         gap = None
         # Training draws its own layout (kind != "fixed"); evals pass one and opt in explicitly.
@@ -560,6 +572,9 @@ def main() -> None:
         torch.save({k: v for k, v in adapter.state_dict().items()}, args.out / f"adapter{tag}.pt")
         network.save_weights(str(args.out / f"lora{tag}.safetensors"), torch.bfloat16,
                              {"lot_h3": "phase5", "rank": str(args.rank)})
+        if dual is not None:
+            torch.save({"state": dual.maps.state_dict(), "rank": dual.maps.rank, "layers": len(dit.blocks),
+                        "run": str(args.out)}, args.out / f"up_maps{tag}.pt")
         print(f"LOT_H3 kind=train_saved tag={tag or 'final'} out={args.out}", flush=True)
 
     network.train()

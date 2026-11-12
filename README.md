@@ -25,6 +25,18 @@ The VAE decode is not shortened; LoT only touches the transformer. Reproduce wit
 
 `h3_musubi.predict(dit, x, t, text, lot=splice)` runs musubi-tuner's H3 forward with three changes on the target video only: the LoT splice embeds its rows, their rotary positions become rectangle centres, and the splice's extent heads replace `video_out` after the shared norm and AdaLN. Text, audio and the 50 blocks are untouched. With an untrained all-1×1 layout the output equals the dense forward exactly (`lot/parity_h3.py`, `rel_rms=0`).
 
+Layouts tile any token grid, including H3's default 1344×768 (24×42 tokens): a 4×4 cell cut by the edge keeps the largest power-of-two pieces that fit (4×2 on the 2-token strip), so nothing is cropped to a multiple of 4. Layouts are per latent frame (a 22-frame clip is 7 latent frames); every token has a temporal extent of 1, as in the LoT paper.
+
+### Mixed-resolution additions (from MPEG-Diffusion)
+
+[`lot/mixed_res.py`](lot/mixed_res.py) adapts three ideas from MPEG-Diffusion ([Menn et al., arXiv 2611.12069](https://arxiv.org/abs/2611.12069)) to LoT's single mixed-extent sequence. [`lot/mixed_res_h3.py`](lot/mixed_res_h3.py) fits, trains and renders them on H3. All three are optional and off by default.
+
+| Piece | Paper | Here |
+|---|---|---|
+| Dense K/V view | Dual-resolution attention: separate K/V per resolution, missing K/V filled by linear maps (Prop. 1: a shared K/V is exact only when the merged tokens are identical) | 1×1 queries attend to every coarse token's key/value expanded to its cells by `k + U Vᵀ k` (copy plus a rank-r delta, ridge-initialised with `fit-kv`), before RoPE, at dense positions. Other queries keep LoT attention. `predict(..., dual=)`, `train_h3.py --dual` |
+| Region head | Self-selected HR region: `s = wᵀ LN(h)` on a middle block, smoothed, threshold `m + α(p − m)` | Same head on block 25's video tokens. The sampler runs a coarse layout, then switches to the per-latent-frame layout the head picks. Labels are self-supervised: tokens where the coarse clean estimate is furthest from the dense model's |
+| Seam mixer | Mixed-resolution decoder's 3D-conv mixer `G` | Zero-initialised 3D-conv residual on the final latent outside the 1×1 region, trained against the dense model's clean estimate |
+
 ## Quick start
 
 ```bash
@@ -35,7 +47,7 @@ export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_in
 export LOT_H3_VAE=/path/to/minimax_h3_video_vae_fp16.safetensors
 hf download johndpope/MiniMax-H3-LoT --local-dir runs/lot_hf
 
-python3 lot/test_lot.py                                                       # CPU, no weights -> ok 28
+python3 lot/test_lot.py                                                       # CPU, no weights -> ok 31
 python3 lot/parity_h3.py                                                      # GPU: LoT 1x1 == dense -> ok=1
 python3 lot/time_lot_h3.py --shape still --trained runs/lot_hf/run4_nikki_distill
 python3 lot/time_lot_h3.py --shape clip  --trained runs/lot_hf/run4_nikki_distill
@@ -51,6 +63,10 @@ All paths are environment variables; [`lot/lot_paths.py`](lot/lot_paths.py) list
 - `third_party/musubi_tuner/`: Apache-2.0, from musubi-tuner, which adapts it from Hugging Face Diffusers; see [`NOTICE`](NOTICE).
 - MiniMax H3 weights, and anything trained from them (the published LoT adapters and LoRAs at [HF johndpope/MiniMax-H3-LoT](https://huggingface.co/johndpope/MiniMax-H3-LoT)), are under the [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE): **not for use in the EU, UK, South Korea or USA**, and keep its `LICENSE` and `NOTICE` with any copy.
 
-## Citation
+## References
 
-Cite the paper: [Level-of-Token Diffusion, arXiv 2610.05816](https://arxiv.org/abs/2610.05816).
+- Nakayama et al., **Level-of-Token Diffusion**, [arXiv 2610.05816](https://arxiv.org/abs/2610.05816). The method this repository implements.
+- Menn, Gu, He, V S, Song, Liu, Xie, Huang (Roblox), Xu and Marculescu (UT Austin), **MPEG-Diffusion: Mixed-Resolution Video Generation**, [arXiv 2611.12069](https://arxiv.org/abs/2611.12069). Source of the dense K/V view, region head and seam mixer in `lot/mixed_res.py`.
+- [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner), the H3 runtime vendored in `third_party/`.
+
+Cite the papers above, not this repository.
