@@ -182,7 +182,7 @@ LOT_H3_TRAIN=1 python3 lot/train_tt.py lora --pairs /data/tt_check/pairs --out /
   --maps /data/tt_check/fit/up_maps_tt.pt --check
 ```
 
-Knobs (environment variables of `train_tt_all.sh`): `COUNT` (photos, default 2000), `STEPS` (LoRA steps, 2000), `SWITCH` (sampler switch step of 20, 12), `SIZE` ("1344 768"), `STAGES` (subset, e.g. `"lora render"`), `PY` (Python with torch). Outputs land in `$WORK/{photos,cache,pairs,fit,lora,region,decoder,render}`; the result to post is `$WORK/render/grid.png` (columns: full res, half res, two-track) and `$WORK/lora/log.jsonl`.
+Knobs (environment variables of `train_tt_all.sh`): `TE_FROM=johndpope/MiniMax-H3-pexels-people-text` (precomputed caption embeddings for the 1,951 Pexels photos, so no 32B text encoder is needed for them), `COUNT` (photos, default 2000), `STEPS` (LoRA steps, 2000), `SWITCH` (sampler switch step of 20, 12), `SIZE` ("1344 768"), `STAGES` (subset, e.g. `"lora render"`), `PY` (Python with torch). Outputs land in `$WORK/{photos,cache,pairs,fit,lora,region,decoder,render}`; the result to post is `$WORK/render/grid.png` (columns: full res, half res, two-track) and `$WORK/lora/log.jsonl`.
 
 ### The stages
 

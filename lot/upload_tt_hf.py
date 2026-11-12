@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Publish a two-track LoRA run (``train_tt.py lora``) to the Hugging Face Hub, checkpoint by checkpoint.
 
-    python3 lot/upload_tt_hf.py --lora-dir RUN/lora --repo johndpope/MiniMax-H3-LoT --folder two_track_run1
+    python3 lot/upload_tt_hf.py --lora-dir RUN/lora --repo johndpope/MiniMax-H3-MPEG-Diffusion --folder run1
     python3 lot/upload_tt_hf.py ... --watch     # wait for the final checkpoint, then upload it
     python3 lot/upload_tt_hf.py ... --all       # also the intermediate checkpoints (lora_500, ...)
 
@@ -157,8 +157,8 @@ def ready(args) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--lora-dir", type=Path, required=True)
-    parser.add_argument("--repo", default="johndpope/MiniMax-H3-LoT")
-    parser.add_argument("--folder", default="two_track_run1")
+    parser.add_argument("--repo", default="johndpope/MiniMax-H3-MPEG-Diffusion")
+    parser.add_argument("--folder", default="run1")
     parser.add_argument("--steps", type=int, default=2000, help="planned steps (for the card)")
     parser.add_argument("--data", default="Data: 1,951 Pexels photos of people (HF list `gaunernst/pexels-portrait`, "
                         "Pexels license) and 403 isometric 3D stills, all at 1344x768, as HR/LR latent pairs with "
