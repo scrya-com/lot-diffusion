@@ -918,6 +918,34 @@ def test_two_track_attention():
     assert not torch.allclose(moved[:, split:], copy[:, split:], atol=1e-4)
 
 
+def test_two_track_decoder_and_pairs():
+    """Untrained U is bicubic, untrained G is a hard paste; pair masks land on the LR token grid."""
+    import numpy as np
+    import torch.nn.functional as F
+
+    from build_pairs_tt import boxes_to_tokens, pixels_to_tokens
+    from mixed_res import LatentUpscaler, TwoTrackMixer
+
+    torch.manual_seed(0)
+    lr = torch.randn(1, 24, 1, 6, 10)
+    want = F.interpolate(lr[:, :, 0], scale_factor=2, mode="bicubic", align_corners=False)
+    assert torch.allclose(LatentUpscaler(width=16)(lr)[:, :, 0], want, atol=1e-5)
+    hr, lr_up = torch.randn(1, 24, 1, 12, 20), torch.randn(1, 24, 1, 12, 20)
+    mask = torch.zeros(1, 1, 1, 12, 20)
+    mask[..., 4:8, 8:12] = 1.0
+    merged = TwoTrackMixer(width=8)(hr, lr_up, mask)
+    assert torch.allclose(merged, mask * hr + (1 - mask) * lr_up, atol=1e-6)
+    # 1344x768 pixels -> 12x21 LR tokens of 64 px; a face box at pixels (130..190, 70..150) covers
+    # tokens rows 1-2, cols 2; grown by one token it is rows 0-3, cols 1-3.
+    face = boxes_to_tokens([(130.0, 70.0, 190.0, 150.0)], 768, 1344, 0)
+    assert face.shape == (1, 12, 21) and face[0].nonzero().tolist() == [[1, 2], [2, 2]]
+    grown = boxes_to_tokens([(130.0, 70.0, 190.0, 150.0)], 768, 1344, 1)
+    assert int(grown.sum()) == 12 and grown[0, 0:4, 1:4].all()
+    pixels = np.zeros((768, 1344), dtype=bool)
+    pixels[64:192, 640:704] = True
+    assert pixels_to_tokens(pixels, 0)[0].nonzero().tolist() == [[1, 10], [2, 10]]
+
+
 def test_region_head_and_mixer():
     """MPEG-Diffusion's self-selected region (mixed_res.region_*) and seam mixer."""
     from layout import dense_layout
@@ -997,6 +1025,7 @@ def main():
         test_layouts_any_grid,
         test_dual_kv_attention,
         test_two_track_attention,
+        test_two_track_decoder_and_pairs,
         test_region_head_and_mixer,
     ]
     for test in tests:

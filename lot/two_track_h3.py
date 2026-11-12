@@ -59,13 +59,17 @@ EXTENT = (1, 2, 2)
 
 def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoTrackPlan | None, t: float,
                       text: torch.Tensor, *, maps: UpMaps | None = None, audio_generator=None,
-                      capture: dict | None = None):
+                      capture: dict | None = None, res_embed: "ResolutionEmbedding | None" = None):
     """Velocities ``(v_lr, v_hr)`` of the LR latent and of the HR latent on the plan's region.
 
     ``lr`` is ``(1, 24, T, h, w)``, ``hr`` is ``(1, 24, T, 2h, 2w)``; ``v_hr`` is zero outside the
     region. With ``plan=None`` (or an empty region) this is the base model on ``lr`` alone.
     ``capture={"block": i}`` returns that block's LR video states in ``capture["states"]``;
     ``capture={"kv": {}}`` collects every block's pre-RoPE LR keys and values.
+    ``res_embed`` adds the paper's learned LR / HR vectors to the video rows.
+
+    With grad enabled (training) the attention patch is installed for good (``_training_patch``)
+    so activation checkpointing recomputes the same attention in the backward pass.
     """
     from h3_musubi import _layout, _silence, _sync_swap, audio_sigma
     from musubi_tuner.minimax_h3.packing import (H3RowSegment, _unpack_video_rows, build_position_grid,
@@ -95,6 +99,8 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
         rows = torch.cat([rows, pack_video_rows(hr.to(device, torch.float32))[:, plan.hr_index]], dim=1)
         positions = torch.cat([positions, hr_positions[plan.hr_index.cpu()]])
     video = dit.video_patch_proj(rows).to(dit.dtype)
+    if res_embed is not None:
+        video = res_embed(video, lr_count)
     audio = _silence(frames, sigma_a, device, audio_generator)
     audio_rows = dit.audio_patch_proj(pack_audio_rows(audio.to(device)).to(torch.float32)).to(dit.dtype)
     text_rows = dit.token_refiner(dit.condition_proj(text.to(device, dit.dtype)))
@@ -110,22 +116,33 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
 
     patch = contextlib.nullcontext()
     want_kv = capture is not None and "kv" in capture
-    if hr_count or want_kv:
+    training = torch.is_grad_enabled()
+    persistent = training or getattr(dit, "_two_track_context", None) is not None
+    if hr_count or want_kv or persistent:
         if hr_count:
             hr_rotation = dit._rotation_table(hr_positions.unsqueeze(0).to(device), hidden.dtype)
-        patch = patched_attention(dit.blocks, attention=two_track_attention,
-                                  plan=plan if plan is not None else _empty_plan(frames, lat_h, lat_w, device),
-                                  maps=maps, video_start=segment.start, hr_rotation=hr_rotation,
-                                  capture=capture.get("kv") if want_kv else None)
+        context = dict(plan=plan if plan is not None and hr_count else _empty_plan(frames, lat_h, lat_w, device),
+                       maps=maps, video_start=segment.start, hr_rotation=hr_rotation,
+                       capture=capture.get("kv") if want_kv else None)
+        if persistent:
+            _training_patch(dit).update(context)
+        else:
+            patch = patched_attention(dit.blocks, attention=two_track_attention, **context)
+    checkpoint = training and dit.gradient_checkpointing
     with patch:
         for index, block in enumerate(dit.blocks):
             if dit.blocks_to_swap:
                 dit.offloader.wait_for_block(index)
-            hidden = block(hidden, temb, timesteps.block_segments, rotation)
+            if checkpoint:
+                hidden = torch.utils.checkpoint.checkpoint(block, hidden, temb, timesteps.block_segments, rotation,
+                                                           use_reentrant=False)
+            else:
+                hidden = block(hidden, temb, timesteps.block_segments, rotation)
             if dit.blocks_to_swap:
                 dit.offloader.submit_move_blocks_forward(dit.blocks, index)
             if capture is not None and capture.get("block") == index:
-                capture["states"] = hidden[0, segment.start:segment.start + lr_count].detach().float()
+                states = hidden[0, segment.start:segment.start + lr_count].float()
+                capture["states"] = states if capture.get("grad") else states.detach()
     hidden = hidden.to(device)
 
     final = dit.final_layer
@@ -143,6 +160,38 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
 
 def _empty_plan(frames: int, lat_h: int, lat_w: int, device) -> TwoTrackPlan:
     return TwoTrackPlan(torch.zeros(frames, lat_h // 2, lat_w // 2, dtype=torch.bool)).to(device)
+
+
+def _training_patch(dit) -> dict:
+    """Route every block's attention through ``two_track_attention`` for the life of the process and
+    return the shared context dict. A context manager would be gone before the backward pass, and
+    checkpointed blocks recompute attention there."""
+    context = getattr(dit, "_two_track_context", None)
+    if context is None:
+        import types
+
+        context = {}
+        for layer, block in enumerate(dit.blocks):
+            def forward(self, hidden, rotation=None, _layer=layer):
+                return two_track_attention(self, hidden, rotation, layer=_layer, **context)
+
+            block.attn.forward = types.MethodType(forward, block.attn)
+        dit._two_track_context = context
+    context.clear()
+    return context
+
+
+class ResolutionEmbedding(torch.nn.Module):
+    """The paper's resolution embedding: one learned vector for LR rows and one for HR rows, zero at init."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.lr = torch.nn.Parameter(torch.zeros(hidden_size))
+        self.hr = torch.nn.Parameter(torch.zeros(hidden_size))
+
+    def forward(self, video: torch.Tensor, lr_count: int) -> torch.Tensor:
+        add = torch.cat([self.lr.expand(lr_count, -1), self.hr.expand(video.shape[1] - lr_count, -1)])
+        return video + add.to(video.dtype).unsqueeze(0)
 
 
 # ------------------------------------------------------------------------ upscaler
@@ -192,7 +241,8 @@ def box_mask(box, frames: int, height: int, width: int) -> torch.Tensor:
 
 
 @torch.no_grad()
-def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_at=None, block=MID_BLOCK):
+def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_at=None, block=MID_BLOCK,
+                  res_embed=None):
     """Base-model Euler sampling; returns ``(x, x0_last, states)`` after ``stop`` steps (default all)."""
     from h3_musubi import sigma_schedule
 
@@ -205,7 +255,7 @@ def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_a
         sigma, sigma_next = float(sigmas[index]), float(sigmas[index + 1])
         capture = {"block": block} if capture_at == index else None
         velocity, _ = two_track_forward(dit, x, None, None, 1.0 - sigma, text, audio_generator=audio_gen,
-                                        capture=capture)
+                                        capture=capture, res_embed=res_embed)
         if capture is not None:
             states = capture["states"]
         x0 = x + sigma * velocity.float()
@@ -215,15 +265,21 @@ def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_a
 
 @torch.no_grad()
 def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, maps=None, head=None, box=None,
-                     block=MID_BLOCK, alpha=0.5, floor=None, feather=0.0, on_mask=None, hr_steps=None):
-    """The four-stage sampler of the module docstring. Returns ``(latent, info)`` at ``width x height``."""
+                     block=MID_BLOCK, alpha=0.5, floor=None, feather=0.0, on_mask=None, hr_steps=None,
+                     res_embed=None, decoder=None):
+    """The four-stage sampler of the module docstring. Returns ``(latent, info)`` at ``width x height``.
+
+    ``decoder`` is ``(U, G)`` from ``train_tt.py decoder``: ``U`` replaces the VAE upscale (at the
+    switch and at the end) and ``G`` merges the tracks (their eqs. 5-6) instead of the feathered paste."""
     from h3_musubi import sigma_schedule
 
     lat_h, lat_w = height // 32, width // 32            # LR latent; also the HR token grid
     tok_h, tok_w = lat_h // 2, lat_w // 2               # LR token grid
     sigmas = sigma_schedule(steps)
     lr, x0_lr, states = native_sample(dit, text, height=height // 2, width=width // 2, steps=steps, seed=seed,
-                                      stop=switch, capture_at=switch - 1 if head is not None else None, block=block)
+                                      stop=switch, capture_at=switch - 1 if head is not None else None, block=block,
+                                      res_embed=res_embed)
+    up = upscale if decoder is None else decoder[0]
     if head is not None:
         scores = head(states).float().cpu().reshape(1, tok_h, tok_w)
         mask = region_mask(scores, alpha=alpha, floor=floor)
@@ -233,23 +289,30 @@ def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, 
         on_mask(mask)
     tokens = [tok_h * tok_w] * switch
     if not mask.any() or switch >= steps:
-        return upscale(lr), {"mask": mask, "tokens": tokens + [tok_h * tok_w] * (steps - switch)}
+        return up(lr), {"mask": mask, "tokens": tokens + [tok_h * tok_w] * (steps - switch)}
     plan = TwoTrackPlan(mask).to("cuda")
     gen = torch.Generator("cuda").manual_seed(seed + 2)
     audio_gen = torch.Generator("cuda").manual_seed(seed + 3)
     sigma = float(sigmas[switch])
-    hr = (1.0 - sigma) * upscale(x0_lr) + sigma * torch.randn(1, 24, 1, 2 * lat_h, 2 * lat_w, device="cuda",
+    hr = (1.0 - sigma) * up(x0_lr) + sigma * torch.randn(1, 24, 1, 2 * lat_h, 2 * lat_w, device="cuda",
                                                               generator=gen)
     # After the switch both tracks share the schedule: the model's own, or ``hr_steps`` steps
     # linear in sigma (H3's shift 12 leaves few low-sigma steps, where the HR detail is made).
     tail = sigmas[switch:] if not hr_steps else torch.linspace(sigma, 0.0, hr_steps + 1, dtype=torch.float64)
     for index in range(len(tail) - 1):
         sigma, sigma_next = float(tail[index]), float(tail[index + 1])
-        v_lr, v_hr = two_track_forward(dit, lr, hr, plan, 1.0 - sigma, text, maps=maps, audio_generator=audio_gen)
+        v_lr, v_hr = two_track_forward(dit, lr, hr, plan, 1.0 - sigma, text, maps=maps, audio_generator=audio_gen,
+                                       res_embed=res_embed)
         ratio = sigma_next / sigma
         lr = lr + (1.0 - ratio) * sigma * v_lr.float()
         hr = hr + (1.0 - ratio) * sigma * v_hr.float()
         tokens.append(plan.lr_count + plan.hr_count)
+    if decoder is not None:
+        upscaler, mixer = decoder
+        inside = mask_to_latent(mask, 2).to("cuda")                     # LR latent grid
+        filled = (1.0 - inside) * lr + inside * upscale.down(hr)        # their eq. 5: fill M with D(z_h)
+        latent = mixer(hr, upscaler(filled), mask_to_latent(mask, 4).to("cuda"))
+        return latent, {"mask": mask, "tokens": tokens}
     weight = mask_to_latent(mask, 4, feather).to("cuda")
     latent = weight * hr + (1.0 - weight) * upscale(lr)
     return latent, {"mask": mask, "tokens": tokens}
@@ -269,6 +332,37 @@ def load_maps(path: Path) -> UpMaps:
     maps = UpMaps(saved["layers"], HEAD_DIM, [EXTENT], rank=saved["rank"])
     maps.load_state_dict(saved["state"])
     return maps.to("cuda").eval()
+
+
+def load_trained(dit, train_dir: Path, tag: str = ""):
+    """LoRA (on), up-maps and resolution embedding from a ``train_tt.py lora`` run. Returns ``(network, maps, res_embed)``."""
+    from safetensors import safe_open
+
+    from h3_musubi import make_lora
+
+    with safe_open(str(train_dir / f"lora{tag}.safetensors"), "pt") as handle:
+        rank = int((handle.metadata() or {}).get("rank", 16))
+    network = make_lora(dit, rank)
+    info = network.load_weights(str(train_dir / f"lora{tag}.safetensors"))
+    if info.missing_keys:
+        raise RuntimeError(f"LoRA load missed {len(info.missing_keys)} keys")
+    network.to(device="cuda", dtype=torch.bfloat16).eval()
+    saved = torch.load(train_dir / f"tt_state{tag}.pt", map_location="cpu", weights_only=False)
+    maps = UpMaps(saved["layers"], HEAD_DIM, [EXTENT], rank=saved["rank"])
+    maps.load_state_dict(saved["maps"])
+    res_embed = ResolutionEmbedding(saved["hidden"])
+    res_embed.load_state_dict(saved["res_embed"])
+    return network, maps.to("cuda").eval(), res_embed.to("cuda").eval()
+
+
+def load_decoder(path: Path):
+    from mixed_res import LatentUpscaler, TwoTrackMixer
+
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    upscaler, mixer = LatentUpscaler(width=saved["up_width"]), TwoTrackMixer(width=saved["mix_width"])
+    upscaler.load_state_dict(saved["upscaler"])
+    mixer.load_state_dict(saved["mixer"])
+    return upscaler.cuda().eval(), mixer.cuda().eval()
 
 
 def load_upscaler() -> VaeUpscaler:
@@ -292,9 +386,15 @@ def render(args) -> None:
     from h3_musubi import sample
     from render_h3 import to_image
 
+    from h3_musubi import set_lora
+
     dit = load_base(args.swap)
     upscale = load_upscaler()
     maps = load_maps(args.maps) if args.maps else None
+    network = res_embed = None
+    if args.train:
+        network, maps, res_embed = load_trained(dit, args.train, args.tag)
+    decoder = load_decoder(args.decoder) if args.decoder else None
     head = None
     if args.region:
         saved = torch.load(args.region, map_location="cpu", weights_only=False)
@@ -313,6 +413,8 @@ def render(args) -> None:
             mask = None
             torch.cuda.synchronize()
             start = time.perf_counter()
+            if network is not None:
+                set_lora(network, name == "two_track")      # the baselines are the base model
             if name == "hr":
                 latent = sample(dit, embeds, height=height, width=width, steps=args.steps, seed=args.seed + index)
                 count = float((height // 32) * (width // 32))
@@ -325,7 +427,8 @@ def render(args) -> None:
                 latent, info = two_track_sample(
                     dit, embeds, upscale, height=height, width=width, steps=args.steps, switch=args.switch,
                     seed=args.seed + index, maps=maps, head=head, box=args.box, block=args.block,
-                    alpha=args.alpha, floor=args.floor, feather=args.feather, hr_steps=args.hr_steps)
+                    alpha=args.alpha, floor=args.floor, feather=args.feather, hr_steps=args.hr_steps,
+                    res_embed=res_embed, decoder=decoder)
                 mask = info["mask"]
                 count = sum(info["tokens"]) / len(info["tokens"])
                 meta["hr_share"].append(round(float(mask.float().mean()), 4))
@@ -352,7 +455,7 @@ def render(args) -> None:
             sheet.paste(image.resize(cell, Image.LANCZOS), (col * cell[0], 28 + r * cell[1]))
     sheet.save(args.out / "grid.png")
     meta.update({"columns": columns, "steps": args.steps, "switch": args.switch, "canvas": f"{width}x{height}",
-                 "maps": str(args.maps), "region": str(args.region), "box": args.box, "feather": args.feather})
+                 "maps": str(args.maps), "train": str(args.train), "decoder": str(args.decoder), "region": str(args.region), "box": args.box, "feather": args.feather})
     (args.out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(f"LOT_H3 kind=two_track_render_done out={args.out} ok=1", flush=True)
 
@@ -402,14 +505,24 @@ def fit_kv(args) -> None:
     from train_h3 import load_item
 
     dit = load_base(args.swap)
-    upscale = load_upscaler()
     layers = len(dit.blocks)
     maps = UpMaps(layers, HEAD_DIM, [EXTENT], rank=args.rank).cuda()
     moments: dict = {}
-    for index, item in enumerate(train_items(args)):
-        x0, text = load_item(item, random.Random(index), "cuda")
-        hr0 = crop_even(x0)
-        lr0 = upscale.down(hr0)
+    if args.pairs:
+        from build_pairs_tt import list_pairs, load_pair
+
+        sources = [("pair", entry) for entry in list_pairs(args.pairs, 8)[0][:args.items]]
+    else:
+        upscale = load_upscaler()
+        sources = [("cache", item) for item in train_items(args)]
+    for index, (kind, item) in enumerate(sources):
+        if kind == "pair":
+            pair = load_pair(item)
+            hr0, lr0, text = pair["hr"], pair["lr"], pair["text"]
+        else:
+            x0, text = load_item(item, random.Random(index), "cuda")
+            hr0 = crop_even(x0)
+            lr0 = upscale.down(hr0)
         plan = TwoTrackPlan(torch.zeros(1, lr0.shape[-2] // 2, lr0.shape[-1] // 2, dtype=torch.bool))
         cells = torch.argsort(plan.cell_order).reshape(plan.lr_count, 4).cuda()      # LR token -> its HR rows
         for sigma in args.sigmas:
@@ -510,7 +623,7 @@ def main() -> None:
     parser.add_argument("--items", type=int, default=24)
     parser.add_argument("--prompts", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--swap", type=int, default=8)
+    parser.add_argument("--swap", default="auto", help="DiT blocks streamed from CPU; auto (by free VRAM): 0 at 64 GB+, 8 at 28+, 16 at 21+, else 24")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--switch", type=int, default=18, help="LR-only steps before the HR region starts")
     parser.add_argument("--hr-steps", type=int, default=6,
@@ -518,6 +631,12 @@ def main() -> None:
     parser.add_argument("--size", type=int, nargs=2, default=(1344, 768), metavar=("W", "H"))
     parser.add_argument("--variants", default="hr,lr,two_track")
     parser.add_argument("--maps", type=Path, default=None, help="up_maps_tt.pt from fit-kv (default: copy)")
+    parser.add_argument("--train", type=Path, default=None,
+                        help="train_tt.py lora output dir: LoRA + fine-tuned maps + resolution embedding (overrides --maps)")
+    parser.add_argument("--tag", default="", help="checkpoint tag in --train, e.g. _1000")
+    parser.add_argument("--decoder", type=Path, default=None, help="decoder.pt from train_tt.py decoder (U and G)")
+    parser.add_argument("--pairs", type=Path, action="append", default=None,
+                        help="fit-kv: build_pairs_tt.py dirs (HR + LR latents precomputed; repeatable)")
     parser.add_argument("--region", type=Path, default=None, help="region_head_tt.pt (default: --box)")
     parser.add_argument("--box", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -530,8 +649,12 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--rank", type=int, default=HEAD_DIM, help="rank of the f_up delta (head dim = full)")
     parser.add_argument("--ridge", type=float, default=1e-2)
-    parser.add_argument("--sigmas", type=float, nargs="+", default=[0.5, 0.8, 0.95])
+    parser.add_argument("--sigmas", type=float, nargs="+", default=[0.2, 0.4, 0.6, 0.8, 0.95],
+                        help="fit-kv: noise levels; cover the sigmas the HR track runs at after the switch")
     args = parser.parse_args()
+    from gpu_guard import auto_swap
+
+    args.swap = auto_swap(args.swap)
     if args.size[0] % 64 or args.size[1] % 64:
         raise SystemExit("--size sides must be multiples of 64 (the LR latent needs whole 2x2 patches)")
     refuse_if_busy("two_track_h3")

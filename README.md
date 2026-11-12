@@ -63,18 +63,18 @@ On the 5090 at 1344×768, 20 steps: full res 1008 tokens/step, half res 252, two
 
 #### Training guidance: weak maps, weak region, weak faces
 
-Faces are the clearest failure. The face in the grid is drawn by the LR track at 672×384, where it covers a few tokens, and the HR track only gets the last low-sigma steps, which add texture but cannot redraw eyes or a mouth. Each item below is grounded in the paper; none has been run here yet.
+Faces are the clearest failure. The face in the grid is drawn by the LR track at 672×384, where it covers a few tokens, and the HR track only gets the last low-sigma steps, which add texture but cannot redraw eyes or a mouth. Each item below is grounded in the paper. Items 2–5 are implemented (`lot/fetch_pexels.py`, `lot/build_pairs_tt.py`, `lot/train_tt.py`, one command: `lot/train_tt_all.sh`; walkthrough in [`lot/CHEATSHEET.md` section 7](lot/CHEATSHEET.md#7-two-track-mixed-resolution-the-papers-own-arrangement-train-it)) and pass a 30-step smoke test on a 5090. No full training run has been done yet, so there is no quality result to report.
 
 1. **Put the face in `M` (no training).** The paper labels the region with the main subject (Qwen2.5 + Grounded SAM) because it "better aligns with human attention" than the perceptual label. For people, a face detector is the cheap version. `--box` takes one normalised box now; there is no detector in the repo yet. Dilate the box by a token so the eyes are not at the seam.
 2. **Fine-tune with the paper's loss so the switch can move earlier.** The HR track must run from a sigma where structure is still open (the paper switches at 50–80% of steps). Recipe:
-   - Pairs: a cached HR latent and its LR latent (`VaeUpscaler.down`), both noised with the same sigma.
+   - Pairs (`build_pairs_tt.py`): a cached HR latent and its LR latent (decode, downsample ×0.5, encode), noised to the same sigma, plus a face mask (OpenCV YuNet) and a person mask (YOLO segmentation) on the LR token grid.
    - Mask: the face or subject mask (or the 25% of tokens per frame with the highest label, as in the paper).
    - Loss: their eq. 2, velocity MSE of LR tokens outside `M` plus HR tokens inside `M`, each normalised by its region's size, through `two_track_forward`.
-   - Train: a LoRA (rank 16 on qkv/out/fc1/fc2, as in `train_h3.py`) instead of the full fine-tune, together with the `UpMaps` and two zero-initialised resolution-embedding vectors (one for HR tokens, one for LR) added to the video rows.
-   - Data: portraits and talking heads (the Nikki cache), so the faces get the gradient.
-3. **Better map initialisation before the fine-tune.** The value fit (0.90 residual) is the weak half. Fit on hundreds of items instead of 24, and on the low sigmas the HR track actually sees after the switch (the current fit uses 0.5, 0.8, 0.95). Optionally fit one map per sigma band. The paper's linear relation is measured on the base model without fine-tuning, so this is a fair initialisation check: if the value cosine stays well under their 0.75, the fine-tune has to carry it.
-4. **Region head on subject labels.** Train the head (`two_track_h3.py region`) with face/subject masks as BCE targets instead of the latent-L1 label. The paper reports mIoU 0.59–0.67 against such masks with a single linear layer.
-5. **Learned upscaler and mixer** (their Sec. H): train `U` and `G` on real stills, with the HR latent inside a random mask and the LR latent outside. Use their eq. 11 loss (latent L1 outside `M`, pixel L1, and LPIPS, up-weighted near the boundary). The VAE round trip used now is soft, and it is what the background and the face's surroundings come from.
+   - Train (`train_tt.py lora`): a LoRA (rank 16 on qkv/out/fc1/fc2) instead of the full fine-tune, together with the `UpMaps` and two zero-initialised resolution-embedding vectors (one for HR tokens, one for LR) added to the video rows.
+   - Data: people photos with captions. `fetch_pexels.py` downloads them from the Hugging Face list `gaunernst/pexels-portrait` (URLs plus captions, Pexels license). Those are mostly large faces, so mix in scenes with small faces, the failing case.
+3. **Better map initialisation before the fine-tune.** The value fit (0.90 residual) is the weak half. `fit-kv --pairs` now fits from the pairs (no VAE round trip per item) over sigmas 0.2–0.95, which covers the sigmas the HR track sees after an earlier switch; use `--items 200` or more. On 4 items the residual was 0.49 on keys and 0.85 on values. The paper's linear relation is also measured on the base model without fine-tuning, so the residual is a fair check: whatever the linear map cannot carry, the LoRA has to.
+4. **Region head on subject labels.** `train_tt.py region` trains the head with the face and person masks as BCE targets instead of the latent-L1 label, on the fine-tuned model's states at the switch, and reports held-out mIoU. The paper reports 0.59–0.67 against such masks with a single linear layer; the 16-item smoke run gave 0.57.
+5. **Learned upscaler and mixer** (their Sec. H): `train_tt.py decoder` trains `U` and `G` on real pairs, with the HR latent inside the mask and the LR latent outside. It uses their eq. 11 loss (latent L1 outside `M` up-weighted at the edge, pixel L1 and LPIPS on a decoded crop at the edge). Gradients pass through the frozen VAE decoder; a 256 px crop peaks at 12 GB. `two_track_h3.py render --decoder` uses `U` at the switch and at the end, and `G` instead of the feathered paste.
 
 Order of value for faces: (1) is free and helps at once; (2) is what lets the HR track fix the face; (3) and (4) make (2) converge faster; (5) is about seams and the background.
 
@@ -88,7 +88,7 @@ export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_in
 export LOT_H3_VAE=/path/to/minimax_h3_video_vae_fp16.safetensors
 hf download johndpope/MiniMax-H3-LoT --local-dir runs/lot_hf
 
-python3 lot/test_lot.py                                                       # CPU, no weights -> ok 32
+python3 lot/test_lot.py                                                       # CPU, no weights -> ok 33
 python3 lot/parity_h3.py                                                      # GPU: LoT 1x1 == dense -> ok=1
 python3 lot/time_lot_h3.py --shape still --trained runs/lot_hf/run4_nikki_distill
 python3 lot/time_lot_h3.py --shape clip  --trained runs/lot_hf/run4_nikki_distill

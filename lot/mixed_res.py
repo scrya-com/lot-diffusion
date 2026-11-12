@@ -447,8 +447,56 @@ def mixer_loss(mixed: torch.Tensor, target: torch.Tensor, layout: LotLayout) -> 
     return ((mixed - target).abs() * outside).sum() / (outside.sum() * mixed.shape[1]).clamp(min=1.0)
 
 
+# ------------------------------------------------- 5. two-track decoder (their Sec. 4.2)
+
+
+class LatentUpscaler(nn.Module):
+    """``U``: LR latent ``(B, C, T, h, w)`` -> ``(B, C, T, 2h, 2w)``, bicubic plus a learned residual.
+
+    The last conv is zero-initialised, so an untrained upscaler is bicubic."""
+
+    def __init__(self, channels: int = 24, width: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, width, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(width, width, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(width, 4 * width, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
+            nn.Conv2d(width, width, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(width, channels, 3, padding=1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        batch, channels, time, height, width = latent.shape
+        frames = latent.permute(0, 2, 1, 3, 4).reshape(batch * time, channels, height, width).float()
+        up = F.interpolate(frames, scale_factor=2, mode="bicubic", align_corners=False) + self.net(frames)
+        return up.reshape(batch, time, channels, 2 * height, 2 * width).permute(0, 2, 1, 3, 4)
+
+
+class TwoTrackMixer(nn.Module):
+    """``z = M z_h + (1 - M)(z_l_up + G(z_h, z_l_up, M))`` (their eq. 6). ``G`` is a small 3D-conv net,
+    zero-initialised, so an untrained mixer is a hard paste."""
+
+    def __init__(self, channels: int = 24, width: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(2 * channels + 1, width, 3, padding=1), nn.SiLU(),
+            nn.Conv3d(width, width, 3, padding=1), nn.SiLU(),
+            nn.Conv3d(width, channels, 3, padding=1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, hr: torch.Tensor, lr_up: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """``hr``, ``lr_up`` ``(B, C, T, H, W)``; ``mask`` ``(B, 1, T, H, W)`` in [0, 1] on the HR latent grid."""
+        hr, lr_up, mask = hr.float(), lr_up.float(), mask.float()
+        delta = self.net(torch.cat([hr * mask, lr_up, mask], dim=1))
+        return mask * hr + (1.0 - mask) * (lr_up + delta)
+
+
 __all__ = [
     "DualKVPlan", "UpMaps", "DualKV", "dual_attention", "patched_attention", "TwoTrackPlan", "two_track_attention", "RegionHead", "scores_to_cells",
     "region_mask", "region_layout", "region_labels", "token_targets", "SeamMixer", "extent_maps",
-    "mixer_loss",
+    "mixer_loss", "LatentUpscaler", "TwoTrackMixer",
 ]
