@@ -347,7 +347,18 @@ def load_trained(dit, train_dir: Path, tag: str = ""):
     if info.missing_keys:
         raise RuntimeError(f"LoRA load missed {len(info.missing_keys)} keys")
     network.to(device="cuda", dtype=torch.bfloat16).eval()
-    saved = torch.load(train_dir / f"tt_state{tag}.pt", map_location="cpu", weights_only=False)
+    published = train_dir / f"tt_state{tag}.safetensors"       # as upload_tt_hf.py publishes it
+    if published.is_file():
+        from safetensors.torch import load_file
+
+        with safe_open(str(published), "pt") as handle:
+            meta = handle.metadata() or {}
+        flat = load_file(str(published))
+        saved = {"layers": int(meta["layers"]), "rank": int(meta["rank"]), "hidden": int(meta["hidden"]),
+                 "maps": {k[5:]: v for k, v in flat.items() if k.startswith("maps.")},
+                 "res_embed": {k[10:]: v for k, v in flat.items() if k.startswith("res_embed.")}}
+    else:
+        saved = torch.load(train_dir / f"tt_state{tag}.pt", map_location="cpu", weights_only=False)
     maps = UpMaps(saved["layers"], HEAD_DIM, [EXTENT], rank=saved["rank"])
     maps.load_state_dict(saved["maps"])
     res_embed = ResolutionEmbedding(saved["hidden"])
