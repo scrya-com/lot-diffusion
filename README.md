@@ -27,15 +27,56 @@ The VAE decode is not shortened; LoT only touches the transformer. Reproduce wit
 
 Layouts tile any token grid, including H3's default 1344×768 (24×42 tokens): a 4×4 cell cut by the edge keeps the largest power-of-two pieces that fit (4×2 on the 2-token strip), so nothing is cropped to a multiple of 4. Layouts are per latent frame (a 22-frame clip is 7 latent frames); every token has a temporal extent of 1, as in the LoT paper.
 
-### Mixed-resolution additions (from MPEG-Diffusion)
+### Mixed resolution, following MPEG-Diffusion
 
-[`lot/mixed_res.py`](lot/mixed_res.py) adapts three ideas from MPEG-Diffusion ([Menn et al., arXiv 2611.12069](https://arxiv.org/abs/2611.12069)) to LoT's single mixed-extent sequence. [`lot/mixed_res_h3.py`](lot/mixed_res_h3.py) fits, trains and renders them on H3. All three are optional and off by default.
+MPEG-Diffusion ([Menn et al., arXiv 2611.12069](https://arxiv.org/abs/2611.12069)) generates the visually important region at high resolution (HR) and the rest at low resolution (LR). Their sampler (Sec. 4) has four stages:
 
-| Piece | Paper | Here |
+1. The first `k` of `T` steps denoise the whole video at LR.
+2. At step `k`, a linear head `s = wᵀ LN(h)` on a middle block picks the HR region `M`.
+3. The clean LR estimate inside `M` is upscaled and re-noised. The remaining steps denoise `M` at HR and the rest at LR, with **dual-resolution attention**: each query reads keys/values (K/V) only at its own resolution, and the missing K/V come from linear maps `W = A + U Vᵀ` (copy/average plus a rank-r delta), applied before RoPE. Their Proposition 1 is the reason: with one shared K/V, a token standing in for `n` tokens is exact only when those tokens are identical.
+4. A mixed-resolution decoder (latent upscaler `U` plus a 3D-conv mixer `G`) merges the two latents before the VAE.
+
+They fully fine-tune the DiT together with the K/V maps and a learned resolution embedding (Wan2.1, 1,250 steps on 64 B200s). Each training video is encoded at both resolutions, noised to the same level, and each latent is supervised only on its own region (their eq. 2). `k` is 25 or 40 of 50 steps.
+
+Two implementations are here:
+
+| Script | LR track | Status |
 |---|---|---|
-| Dense K/V view | Dual-resolution attention: separate K/V per resolution, missing K/V filled by linear maps (Prop. 1: a shared K/V is exact only when the merged tokens are identical) | 1×1 queries attend to every coarse token's key/value expanded to its cells by `k + U Vᵀ k` (copy plus a rank-r delta, ridge-initialised with `fit-kv`), before RoPE, at dense positions. Other queries keep LoT attention. `predict(..., dual=)`, `train_h3.py --dual` |
-| Region head | Self-selected HR region: `s = wᵀ LN(h)` on a middle block, smoothed, threshold `m + α(p − m)` | Same head on block 25's video tokens. The sampler runs a coarse layout, then switches to the per-latent-frame layout the head picks. Labels are self-supervised: tokens where the coarse clean estimate is furthest from the dense model's |
-| Seam mixer | Mixed-resolution decoder's 3D-conv mixer `G` | Zero-initialised 3D-conv residual on the final latent outside the 1×1 region, trained against the dense model's clean estimate |
+| [`lot/two_track_h3.py`](lot/two_track_h3.py) | The unmodified H3 model at half resolution, as in the paper. HR tokens exist only on `M`. No LoT adapter. | Clean, coherent images with no fine-tuning. Faces are only as good as the LR track draws them (see below). |
+| [`lot/mixed_res_h3.py`](lot/mixed_res_h3.py) | LoT merged tokens from a `train_h3` run, with the three pieces adapted to LoT's single mixed-extent sequence. | Output is smeared: it inherits the LoT adapter's coarse regions, which are already soft without these additions. |
+
+Both use [`lot/mixed_res.py`](lot/mixed_res.py) (attention, region head, mixer; model-agnostic and covered by CPU tests).
+
+#### What `two_track_h3.py` matches and what it does not
+
+| Paper | Here |
+|---|---|
+| LR = base model at half resolution | Same: 672×384 for a 1344×768 still. H3's rotary positions are normalised by `sqrt(area)`, so both grids share one coordinate frame. |
+| Dual-resolution attention, maps before RoPE | Same for HR queries (`two_track_attention`). LR queries see only LR keys, so the LR track is exactly the base model and no `f_down` is needed. |
+| Maps ridge-initialised on paired K/V | Same (`fit-kv`, 24 images, full rank). The fit is weak: relative residual 0.52 on keys and 0.90 on values (copying gives 0.63 and 1.11). The paper reports cosine 0.94 for keys and 0.75 for values on Wan. |
+| DiT + maps + resolution embedding fine-tuned | **Not done.** This is the main gap. |
+| Region head on object labels (LLM + Grounded SAM) or an LPIPS label | Latent-L1 label: the 25% of tokens where the upscaled LR estimate is furthest from the true HR latent. It tends to pick rugs and furniture texture over people, the failure the paper warns about for perceptual labels. |
+| Learned upscaler `U` and mixer `G` | `U` is the VAE (decode, bicubic ×2, encode); `G` is a feathered paste. |
+| `k` = 50–80% of steps | `k` = 18 of 20, then 6 extra steps linear in sigma. Earlier switches drift from the LR track without the fine-tune, which shows as seams. |
+
+On the 5090 at 1344×768, 20 steps: full res 1008 tokens/step, half res 252, two-track 281–322 (12–28% of the frame at HR). Wall time is about the same for all three (17–21 s) at `--swap 8`, and two-track runs 24 forwards, so this is a quality testbed, not yet a speedup.
+
+#### Training guidance: weak maps, weak region, weak faces
+
+Faces are the clearest failure. The face in the grid is drawn by the LR track at 672×384, where it covers a few tokens, and the HR track only gets the last low-sigma steps, which add texture but cannot redraw eyes or a mouth. Each item below is grounded in the paper; none has been run here yet.
+
+1. **Put the face in `M` (no training).** The paper labels the region with the main subject (Qwen2.5 + Grounded SAM) because it "better aligns with human attention" than the perceptual label. For people, a face detector is the cheap version. `--box` takes one normalised box now; there is no detector in the repo yet. Dilate the box by a token so the eyes are not at the seam.
+2. **Fine-tune with the paper's loss so the switch can move earlier.** The HR track must run from a sigma where structure is still open (the paper switches at 50–80% of steps). Recipe:
+   - Pairs: a cached HR latent and its LR latent (`VaeUpscaler.down`), both noised with the same sigma.
+   - Mask: the face or subject mask (or the 25% of tokens per frame with the highest label, as in the paper).
+   - Loss: their eq. 2, velocity MSE of LR tokens outside `M` plus HR tokens inside `M`, each normalised by its region's size, through `two_track_forward`.
+   - Train: a LoRA (rank 16 on qkv/out/fc1/fc2, as in `train_h3.py`) instead of the full fine-tune, together with the `UpMaps` and two zero-initialised resolution-embedding vectors (one for HR tokens, one for LR) added to the video rows.
+   - Data: portraits and talking heads (the Nikki cache), so the faces get the gradient.
+3. **Better map initialisation before the fine-tune.** The value fit (0.90 residual) is the weak half. Fit on hundreds of items instead of 24, and on the low sigmas the HR track actually sees after the switch (the current fit uses 0.5, 0.8, 0.95). Optionally fit one map per sigma band. The paper's linear relation is measured on the base model without fine-tuning, so this is a fair initialisation check: if the value cosine stays well under their 0.75, the fine-tune has to carry it.
+4. **Region head on subject labels.** Train the head (`two_track_h3.py region`) with face/subject masks as BCE targets instead of the latent-L1 label. The paper reports mIoU 0.59–0.67 against such masks with a single linear layer.
+5. **Learned upscaler and mixer** (their Sec. H): train `U` and `G` on real stills, with the HR latent inside a random mask and the LR latent outside. Use their eq. 11 loss (latent L1 outside `M`, pixel L1, and LPIPS, up-weighted near the boundary). The VAE round trip used now is soft, and it is what the background and the face's surroundings come from.
+
+Order of value for faces: (1) is free and helps at once; (2) is what lets the HR track fix the face; (3) and (4) make (2) converge faster; (5) is about seams and the background.
 
 ## Quick start
 
@@ -47,7 +88,7 @@ export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_in
 export LOT_H3_VAE=/path/to/minimax_h3_video_vae_fp16.safetensors
 hf download johndpope/MiniMax-H3-LoT --local-dir runs/lot_hf
 
-python3 lot/test_lot.py                                                       # CPU, no weights -> ok 31
+python3 lot/test_lot.py                                                       # CPU, no weights -> ok 32
 python3 lot/parity_h3.py                                                      # GPU: LoT 1x1 == dense -> ok=1
 python3 lot/time_lot_h3.py --shape still --trained runs/lot_hf/run4_nikki_distill
 python3 lot/time_lot_h3.py --shape clip  --trained runs/lot_hf/run4_nikki_distill
@@ -66,7 +107,7 @@ All paths are environment variables; [`lot/lot_paths.py`](lot/lot_paths.py) list
 ## References
 
 - Nakayama et al., **Level-of-Token Diffusion**, [arXiv 2610.05816](https://arxiv.org/abs/2610.05816). The method this repository implements.
-- Menn, Gu, He, V S, Song, Liu, Xie, Huang (Roblox), Xu and Marculescu (UT Austin), **MPEG-Diffusion: Mixed-Resolution Video Generation**, [arXiv 2611.12069](https://arxiv.org/abs/2611.12069). Source of the dense K/V view, region head and seam mixer in `lot/mixed_res.py`.
+- Menn, Gu, He, V S, Song, Liu, Xie, Huang (Roblox), Xu and Marculescu (UT Austin), **MPEG-Diffusion: Mixed-Resolution Video Generation**, [arXiv 2611.12069](https://arxiv.org/abs/2611.12069). Source of the dual-resolution attention, region head and mixed-resolution sampler in `lot/mixed_res.py` and `lot/two_track_h3.py`.
 - [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner), the H3 runtime vendored in `third_party/`.
 
 Cite the papers above, not this repository.

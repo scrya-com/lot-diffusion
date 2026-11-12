@@ -237,7 +237,7 @@ def dual_attention(attn, hidden: torch.Tensor, rotation: torch.Tensor, *, layer:
 
 
 @contextlib.contextmanager
-def patched_attention(blocks, **context):
+def patched_attention(blocks, attention=None, **context):
     """Route every block's ``attn.forward`` through ``dual_attention`` for one forward pass.
 
     musubi-tuner's code is unchanged: the instance attribute shadows the class method and is
@@ -248,7 +248,7 @@ def patched_attention(blocks, **context):
             attn = block.attn
 
             def forward(self, hidden, rotation=None, _layer=layer):
-                return dual_attention(self, hidden, rotation, layer=_layer, **context)
+                return (attention or dual_attention)(self, hidden, rotation, layer=_layer, **context)
 
             attn.forward = types.MethodType(forward, attn)
             patched.append(attn)
@@ -256,6 +256,82 @@ def patched_attention(blocks, **context):
     finally:
         for attn in patched:
             del attn.forward
+
+
+# ------------------------------------------------------------- 4. two native tracks
+
+
+class TwoTrackPlan:
+    """Index tensors for the paper's own arrangement: a complete native LR grid plus HR tokens on a mask.
+
+    ``mask`` is ``(T, h, w)`` bool on the LR token grid; every masked LR token has ``scale * scale``
+    HR tokens. ``hr_index`` are their rows in the HR grid's raster order (the order of the HR
+    track's rows), and ``cell_order`` permutes "LR token, then its cells row-major" into HR raster.
+    """
+
+    def __init__(self, mask: torch.Tensor, scale: int = 2):
+        mask = mask.bool().cpu()
+        time, height, width = mask.shape
+        self.mask, self.scale = mask, int(scale)
+        self.lr_count = time * height * width
+        self.hr_shape = (time, height * scale, width * scale)
+        up = mask.repeat_interleave(scale, 1).repeat_interleave(scale, 2)
+        self.hr_index = torch.nonzero(up.flatten()).squeeze(1)
+        t, u, v = torch.meshgrid(torch.arange(time), torch.arange(height), torch.arange(width), indexing="ij")
+        du, dv = torch.meshgrid(torch.arange(scale), torch.arange(scale), indexing="ij")
+        cells = (t.reshape(-1, 1) * (height * scale) + u.reshape(-1, 1) * scale + du.reshape(1, -1)) * (width * scale) \
+            + v.reshape(-1, 1) * scale + dv.reshape(1, -1)                                   # (lr, scale^2)
+        self.cell_order = torch.argsort(cells.flatten())
+        self.extent = (1, self.scale, self.scale)
+
+    @property
+    def hr_count(self) -> int:
+        return int(self.hr_index.numel())
+
+    def to(self, device) -> "TwoTrackPlan":
+        self.hr_index = self.hr_index.to(device)
+        self.cell_order = self.cell_order.to(device)
+        return self
+
+
+def two_track_attention(attn, hidden: torch.Tensor, rotation: torch.Tensor, *, layer: int, plan: TwoTrackPlan,
+                        maps: UpMaps | None, video_start: int, hr_rotation: torch.Tensor,
+                        capture: dict | None = None) -> torch.Tensor:
+    """Dual-resolution attention (their eq. 3) on ``[text, audio, LR video (whole grid), HR video (mask)]``.
+
+    Text, audio and LR queries see only text, audio and LR keys: that part is the unmodified model
+    at LR, so it needs no ``f_down``. HR queries see text, audio and a full HR grid of keys/values:
+    their own inside the mask, ``f_up`` of the LR token's outside it (``maps=None`` copies), rotated
+    at the HR grid's positions (``hr_rotation``, the table of the whole HR grid).
+    """
+    batch, length, _ = hidden.shape
+    query, key, value = attn.qkv_proj(hidden).split(attn.inner_dim, dim=-1)
+    query = attn.q_norm(query.reshape(batch, length, attn.num_heads, attn.head_dim))
+    key = attn.k_norm(key.reshape(batch, length, attn.num_heads, attn.head_dim))
+    value = value.reshape(batch, length, attn.num_heads, attn.head_dim).contiguous()
+    split = video_start + plan.lr_count
+    if capture is not None:
+        capture[layer] = (key[:, video_start:split].detach(), value[:, video_start:split].detach())
+    query_r = _rope(query, rotation).to(value)
+    key_r = _rope(key, rotation).to(value)
+    output = hidden.new_zeros(batch, length, attn.inner_dim, dtype=value.dtype)
+    output[:, :split] = _sdpa(query_r[:, :split], key_r[:, :split], value[:, :split])
+    if plan.hr_count:
+        cells = plan.scale * plan.scale
+        lr_key, lr_value = key[:, video_start:split], value[:, video_start:split]
+        if maps is None:
+            grid_key = lr_key.repeat_interleave(cells, dim=1)
+            grid_value = lr_value.repeat_interleave(cells, dim=1)
+        else:
+            grid_key = maps.expand(layer, plan.extent, "k", lr_key).to(key.dtype)
+            grid_value = maps.expand(layer, plan.extent, "v", lr_value).to(value.dtype)
+        grid_key = grid_key[:, plan.cell_order].index_copy(1, plan.hr_index, key[:, split:])
+        grid_value = grid_value[:, plan.cell_order].index_copy(1, plan.hr_index, value[:, split:])
+        grid_key = _rope(grid_key, hr_rotation).to(value)
+        output[:, split:] = _sdpa(query_r[:, split:],
+                                  torch.cat([key_r[:, :video_start], grid_key], dim=1),
+                                  torch.cat([value[:, :video_start], grid_value], dim=1))
+    return attn.out_proj(output)
 
 
 # ------------------------------------------------------------------ 1. region head
@@ -372,7 +448,7 @@ def mixer_loss(mixed: torch.Tensor, target: torch.Tensor, layout: LotLayout) -> 
 
 
 __all__ = [
-    "DualKVPlan", "UpMaps", "DualKV", "dual_attention", "patched_attention", "RegionHead", "scores_to_cells",
+    "DualKVPlan", "UpMaps", "DualKV", "dual_attention", "patched_attention", "TwoTrackPlan", "two_track_attention", "RegionHead", "scores_to_cells",
     "region_mask", "region_layout", "region_labels", "token_targets", "SeamMixer", "extent_maps",
     "mixer_loss",
 ]

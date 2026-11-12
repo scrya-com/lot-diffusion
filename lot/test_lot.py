@@ -837,6 +837,87 @@ def test_dual_kv_attention():
     assert cache.plan(lot, "cpu") is cache.plan(lot, "cpu")
 
 
+def test_two_track_attention():
+    """Native LR grid + HR tokens on a mask (MPEG-Diffusion's own arrangement)."""
+    import types
+
+    from mixed_res import TwoTrackPlan, UpMaps, _rope, _sdpa, two_track_attention
+
+    torch.manual_seed(0)
+    heads, dim, text = 2, 8, 3
+    inner = heads * dim
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads, self.head_dim, self.inner_dim = heads, dim, inner
+            self.qkv_proj = torch.nn.Linear(inner, 3 * inner, bias=False)
+            self.q_norm = self.k_norm = torch.nn.Identity()
+            self.out_proj = torch.nn.Identity()
+
+    attn = Attn()
+
+    def table(count):
+        angle = torch.rand(1, count, 1, dim // 2)
+        cos, sin = angle.cos(), angle.sin()
+        return torch.stack((torch.stack((cos, -sin), -1), torch.stack((sin, cos), -1)), -2)
+
+    def plain(hidden, rotation):
+        q, k, v = attn.qkv_proj(hidden).split(inner, dim=-1)
+        shape = (1, hidden.shape[1], heads, dim)
+        return _sdpa(_rope(q.reshape(shape), rotation), _rope(k.reshape(shape), rotation), v.reshape(shape))
+
+    # The plan: HR rows are the masked tokens' cells in HR raster order; every cell is covered once.
+    mask = torch.zeros(1, 3, 5, dtype=torch.bool)
+    mask[0, 1, 1:4] = True
+    plan = TwoTrackPlan(mask)
+    assert plan.lr_count == 15 and plan.hr_count == 12 and plan.hr_shape == (1, 6, 10)
+    assert plan.hr_index.tolist() == [22, 23, 24, 25, 26, 27, 32, 33, 34, 35, 36, 37]
+    cells = torch.argsort(plan.cell_order).reshape(15, 4)
+    assert cells[0].tolist() == [0, 1, 10, 11] and cells[6].tolist() == [22, 23, 32, 33]
+    assert sorted(cells.flatten().tolist()) == list(range(60))
+
+    lr_count, hr_count = plan.lr_count, plan.hr_count
+    hidden = torch.randn(1, text + lr_count + hr_count, inner)
+    rotation, hr_rotation = table(text + lr_count + hr_count), table(4 * lr_count)
+    out = two_track_attention(attn, hidden, rotation, layer=0, plan=plan, maps=None, video_start=text,
+                              hr_rotation=hr_rotation)
+    # 1. Text and LR rows are the unmodified model on [text, LR]: the HR rows do not reach them.
+    split = text + lr_count
+    assert torch.allclose(out[:, :split], plain(hidden[:, :split], rotation[:, :split]), atol=1e-5)
+    changed = hidden.clone()
+    changed[:, split:] += 1.0
+    again = two_track_attention(attn, changed, rotation, layer=0, plan=plan, maps=None, video_start=text,
+                                hr_rotation=hr_rotation)
+    assert torch.allclose(again[:, :split], out[:, :split], atol=1e-6)
+
+    # 2. With the whole grid at HR, the HR rows are the unmodified model on [text, HR grid].
+    full = TwoTrackPlan(torch.ones(1, 3, 5, dtype=torch.bool))
+    hidden = torch.randn(1, text + lr_count + 4 * lr_count, inner)
+    rotation = table(hidden.shape[1])
+    out = two_track_attention(attn, hidden, rotation, layer=0, plan=full, maps=None, video_start=text,
+                              hr_rotation=rotation[:, split:])
+    keep = torch.cat([torch.arange(text), torch.arange(split, hidden.shape[1])])
+    assert torch.allclose(out[:, split:], plain(hidden[:, keep], rotation[:, keep])[:, text:], atol=1e-5)
+
+    # 3. Outside the mask an HR query reads f_up of the LR key: zero-delta maps equal the copy, a
+    # non-zero delta changes only the HR rows.
+    hidden = torch.randn(1, text + lr_count + hr_count, inner)
+    rotation = table(hidden.shape[1])
+    maps = UpMaps(1, dim, [(1, 2, 2)], rank=4)
+    copy = two_track_attention(attn, hidden, rotation, layer=0, plan=plan, maps=None, video_start=text,
+                               hr_rotation=hr_rotation)
+    zero = two_track_attention(attn, hidden, rotation, layer=0, plan=plan, maps=maps, video_start=text,
+                               hr_rotation=hr_rotation)
+    assert torch.allclose(copy, zero, atol=1e-6)
+    with torch.no_grad():
+        maps.up["l0_2x2_k"].normal_()
+    moved = two_track_attention(attn, hidden, rotation, layer=0, plan=plan, maps=maps, video_start=text,
+                                hr_rotation=hr_rotation)
+    assert torch.allclose(moved[:, :split], copy[:, :split], atol=1e-6)
+    assert not torch.allclose(moved[:, split:], copy[:, split:], atol=1e-4)
+
+
 def test_region_head_and_mixer():
     """MPEG-Diffusion's self-selected region (mixed_res.region_*) and seam mixer."""
     from layout import dense_layout
@@ -915,6 +996,7 @@ def main():
         test_layout_sources,
         test_layouts_any_grid,
         test_dual_kv_attention,
+        test_two_track_attention,
         test_region_head_and_mixer,
     ]
     for test in tests:

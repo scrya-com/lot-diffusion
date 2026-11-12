@@ -147,6 +147,19 @@ LOT_H3_TRAIN=1 python3 lot/train_h3.py --pairs $P --init $R --dual $O/up_maps.pt
 
 `render` decodes in a fresh process (it `exec`s `mixed_res_h3.py decode`), because the DiT does not return its VRAM inside the sampling process.
 
+### Two native tracks (the paper's own arrangement, no LoT adapter)
+
+`lot/two_track_h3.py` runs the unmodified base model at half resolution as the LR track and adds HR tokens only on a selected region, with dual-resolution attention (`mixed_res.two_track_attention`). It needs no run directory. Stills only.
+
+```bash
+O=lot/runs/my_tt
+python3 lot/two_track_h3.py fit-kv --out $O --items 24     # ridge fit of f_up (base model at LR and HR) -> up_maps_tt.pt
+python3 lot/two_track_h3.py region --out $O --items 120    # region head on the LR track -> region_head_tt.pt
+python3 lot/two_track_h3.py render --out $O/render --maps $O/up_maps_tt.pt --region $O/region_head_tt.pt   # hr | lr | two_track
+```
+
+Defaults: 18 of 20 steps at LR, then `--hr-steps 6` (linear in sigma) on both tracks, `--feather 4`. `--box X0 Y0 X1 Y1` replaces the head; `--outline` draws the region. The fitted maps are required in practice: with copies (`--maps` omitted) the HR region is texture noise. Nothing is fine-tuned, so an earlier `--switch` drifts from the LR track; the paper trains the DiT with the maps for that.
+
 ## ComfyUI (stills and video)
 
 The LoT nodes live in [ComfyUI-MiniMax-H3-Image-Lane](https://github.com/scrya-com/ComfyUI-MiniMax-H3-Image-Lane): **MiniMax H3 LoT Apply** (layouts `center` / `bands` / `uniform2` / `uniform4` / `dense`) and **MiniMax H3 LoT Unscale Latent**, which is required before VAE Decode. Workflows (API format; they also ship in the pack's `workflows/`), each a LoT branch plus a dense A/B branch from one seed:
