@@ -151,15 +151,38 @@ LOT_H3_TRAIN=1 python3 lot/train_h3.py --pairs $P --init $R --dual $O/up_maps.pt
 
 `lot/two_track_h3.py` runs the unmodified H3 at half resolution (LR track) and adds full-resolution (HR) tokens only on a region, with dual-resolution attention. Untrained, it renders clean images, but faces are only as good as the LR track draws them: the HR track joins at step 18 of 20 and can only add texture. Training lets it join earlier and redraw the face. The background and the paper's recipe are in the [README](../README.md#mixed-resolution-following-mpeg-diffusion).
 
-### One command
+### One command, from a fresh machine
 
 ```bash
-export LOT_H3_CHECKPOINT=... LOT_H3_VAE=... LOT_H3_TEXT_ENCODER=...    # lot/lot_paths.py
-WORK=/data/tt bash lot/train_tt_all.sh                                 # all stages, resumable
-WORK=/data/tt STAGES="lora render" STEPS=4000 bash lot/train_tt_all.sh  # some stages
+# 1. Code and Python deps (install torch for your CUDA first)
+git clone https://github.com/scrya-com/lot-diffusion && cd lot-diffusion
+pip install -r requirements.txt
+
+# 2. Weights: int8 DiT (21 GB), video VAE, Qwen3-VL text encoder (NVFP4 needs a Blackwell card;
+#    elsewhere use text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors)
+hf download Comfy-Org/MiniMax-H3 \
+  diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  vae/minimax_h3_video_vae_fp16.safetensors \
+  text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --local-dir models
+export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+export LOT_H3_VAE=$PWD/models/vae/minimax_h3_video_vae_fp16.safetensors
+export LOT_H3_TEXT_ENCODER=$PWD/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+
+# 3. Pick the card (CUDA's default order is fastest-first, not nvidia-smi's) and check the install
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
+python3 lot/test_lot.py                              # CPU, no weights -> ok 33
+
+# 4. Everything: 2,000 photos -> cache -> pairs -> maps -> LoRA -> region head -> decoder -> render
+WORK=/data/tt bash lot/train_tt_all.sh
+
+# Optional, before step 4: a 24-photo dry run and one training step, to see peak memory on this card
+WORK=/data/tt_check COUNT=24 STAGES="fetch cache pairs fitkv" bash lot/train_tt_all.sh
+LOT_H3_TRAIN=1 python3 lot/train_tt.py lora --pairs /data/tt_check/pairs --out /data/tt_check/lora \
+  --maps /data/tt_check/fit/up_maps_tt.pt --check
 ```
 
-On a box with several cards, pick one first: `export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=N` (without `PCI_BUS_ID`, CUDA orders cards fastest-first, not as `nvidia-smi` lists them). Use the miniconda/venv Python that has torch (`PY=/path/to/python`).
+Knobs (environment variables of `train_tt_all.sh`): `COUNT` (photos, default 2000), `STEPS` (LoRA steps, 2000), `SWITCH` (sampler switch step of 20, 12), `SIZE` ("1344 768"), `STAGES` (subset, e.g. `"lora render"`), `PY` (Python with torch). Outputs land in `$WORK/{photos,cache,pairs,fit,lora,region,decoder,render}`; the result to post is `$WORK/render/grid.png` (columns: full res, half res, two-track) and `$WORK/lora/log.jsonl`.
 
 ### The stages
 

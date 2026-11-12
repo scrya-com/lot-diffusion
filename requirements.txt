@@ -11,3 +11,7 @@ tqdm
 triton                    # fused ConvRot int8 kernels; without it musubi falls back to dequantize-per-forward
 bitsandbytes              # 8-bit AdamW in train_h3.py (falls back to torch AdamW)
 matplotlib                # train_synth.py / infer.py previews only
+# two-track training (lot/build_pairs_tt.py, lot/train_tt.py)
+opencv-python             # YuNet face detector
+ultralytics               # --subject yolo person masks
+lpips                     # decoder perceptual loss
