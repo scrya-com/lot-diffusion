@@ -31,11 +31,11 @@ def main() -> None:
     for name in MODULES:
         text = (HERE / f"{name}.py").read_text()
         text = pattern.sub(r"from .\1 import ", text)
-        header = (f"# Vendored from scrya-com/lot-diffusion lot/{name}.py at {commit}.\n"
+        header = (f"# Vendored from scrya-com/mpeg-diffusion lot/{name}.py at {commit}.\n"
                   f"# Do not edit here: change lot and re-run lot/vendor_comfy.py.\n")
         (target / f"{name}.py").write_text(header + text)
     (target / "__init__.py").write_text(
-        f'"""Level-of-Token core for MiniMax H3, vendored from scrya-com/lot-diffusion at {commit}."""\n')
+        f'"""Level-of-Token core for MiniMax H3, vendored from scrya-com/mpeg-diffusion at {commit}."""\n')
     print(f"vendored {len(MODULES)} modules into {target} from {commit}")
 
 

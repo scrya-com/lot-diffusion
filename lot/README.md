@@ -1,8 +1,8 @@
 # Level-of-Token Diffusion, drop-in for MiniMax-H3
 
-> **⚠️ Research: the published LoT weights still need more training — help wanted: [help-wanted discussion](https://github.com/scrya-com/lot-diffusion/discussions/1).** Quick start and current numbers: [CHEATSHEET.md](CHEATSHEET.md). Weights: [HF johndpope/MiniMax-H3-LoT](https://huggingface.co/johndpope/MiniMax-H3-LoT) (MiniMax H3 Community License; not for use in the EU, UK, South Korea or USA). ComfyUI nodes: [ComfyUI-MiniMax-H3-Image-Lane](https://github.com/scrya-com/ComfyUI-MiniMax-H3-Image-Lane).
+> **⚠️ Research: the published LoT weights still need more training — help wanted: [help-wanted discussion](https://github.com/scrya-com/mpeg-diffusion/discussions/1).** Quick start and current numbers: [CHEATSHEET.md](CHEATSHEET.md). Weights: [HF johndpope/MiniMax-H3-LoT](https://huggingface.co/johndpope/MiniMax-H3-LoT) (MiniMax H3 Community License; not for use in the EU, UK, South Korea or USA). ComfyUI nodes: [ComfyUI-MiniMax-H3-Image-Lane](https://github.com/scrya-com/ComfyUI-MiniMax-H3-Image-Lane).
 
-Method code for [Level-of-Token Diffusion](https://arxiv.org/abs/2610.05816) (Nakayama et al., 2026). A LoT layout replaces the uniform visual token grid with rectangles of mixed size. The transformer sees the short sequence. A patch-wise asymmetric flow, taken from LakonLab, turns that sequence back into a dense velocity on the original lattice.
+Method code for [Level-of-Token Diffusion](https://arxiv.org/abs/2610.05816) (Kiyohiro Nakayama, Brian Chao, Jan Ackermann, Hansheng Chen, Federico Tombari, Leonidas Guibas, Lior Yariv and Gordon Wetzstein, 2026). A LoT layout replaces the uniform visual token grid with rectangles of mixed size. The transformer sees the short sequence. A patch-wise asymmetric flow, taken from LakonLab, turns that sequence back into a dense velocity on the original lattice.
 
 The core modules (`layout`, `flow`, `adapter`, `h3`, `h3_positions`, `h3_splice`, `layout_sources`) import no model code and load no weights. `h3_musubi.py` runs them on H3 through the vendored musubi-tuner subset in `../third_party`.
 

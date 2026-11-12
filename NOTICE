@@ -1,4 +1,4 @@
-lot-diffusion
+mpeg-diffusion (formerly lot-diffusion)
 Copyright 2026 scrya-com contributors. Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 This product includes software from musubi-tuner
@@ -9,7 +9,7 @@ modules carry their own "Copyright 2025 The MiniMax Team and The HuggingFace Tea
 modules/convrot_int8_kernels.py is modified from comfy-kitchen (Apache-2.0). The files are in
 third_party/musubi_tuner/, copied without modification; third_party/README.md lists them.
 
-Level-of-Token Diffusion is described in Nakayama et al., arXiv 2610.05816. The eq. 9 velocity
+Level-of-Token Diffusion is described in Kiyohiro Nakayama, Brian Chao, Jan Ackermann, Hansheng Chen, Federico Tombari, Leonidas Guibas, Lior Yariv and Gordon Wetzstein, arXiv 2610.05816. The eq. 9 velocity
 recovery can optionally use LakonLab (not included; see lot/flow.py).
 
 MiniMax H3 model weights are NOT included. They, and any weights trained from them, are

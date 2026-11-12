@@ -1,9 +1,9 @@
-# lot-diffusion
+# mpeg-diffusion
 
-Level-of-Token Diffusion ([Nakayama et al., arXiv 2610.05816](https://arxiv.org/abs/2610.05816)) for the MiniMax H3 video DiT.
+Mixed-resolution generation for the MiniMax H3 video DiT: MPEG-Diffusion two-track sampling ([Dennis Menn, Tianpei Gu, Guande He, Aryan V S, Yanke Song, Nan Liu, Desai Xie, Xun Huang, Chenfeng Xu and Diana Marculescu, arXiv 2611.12069](https://arxiv.org/abs/2611.12069)), which spends full-resolution tokens only on a selected region, and Level-of-Token Diffusion ([Kiyohiro Nakayama, Brian Chao, Jan Ackermann, Hansheng Chen, Federico Tombari, Leonidas Guibas, Lior Yariv and Gordon Wetzstein, arXiv 2610.05816](https://arxiv.org/abs/2610.05816)), which merges tokens where detail is low. This repository was called `lot-diffusion`; GitHub redirects the old URLs. Page: [scrya.com/mpeg_diffusion](https://scrya.com/mpeg_diffusion).
 
 > [!WARNING]
-> **Research code and research weights.** LoT output is still visibly worse than dense H3: coarse regions are soft, and faces in talking-head shots distort in fixed layouts. The method needs more training. Help wanted: [discussion](https://github.com/scrya-com/lot-diffusion/discussions/1). Results and renders: [johndpope/MiniMax-H3 issue 1](https://github.com/johndpope/MiniMax-H3/issues/1).
+> **Research code and research weights.** LoT output is still visibly worse than dense H3: coarse regions are soft, and faces in talking-head shots distort in fixed layouts. The method needs more training. Help wanted: [discussion](https://github.com/scrya-com/mpeg-diffusion/discussions/1). Results and renders: [johndpope/MiniMax-H3 issue 1](https://github.com/johndpope/MiniMax-H3/issues/1).
 
 LoT gives the transformer fewer, larger tokens where detail is low and recovers the full-resolution velocity afterwards (the paper's eq. 9, patch-wise asymmetric flow). The VAE latent stays full size; only the transformer sequence shrinks. One H3 DiT forward on a 24 GB card (RTX PRO 4000 Blackwell, run-4 weights, all blocks resident):
 
@@ -29,7 +29,7 @@ Layouts tile any token grid, including H3's default 1344×768 (24×42 tokens): a
 
 ### Mixed resolution, following MPEG-Diffusion
 
-MPEG-Diffusion ([Menn et al., arXiv 2611.12069](https://arxiv.org/abs/2611.12069)) generates the visually important region at high resolution (HR) and the rest at low resolution (LR). Their sampler (Sec. 4) has four stages:
+MPEG-Diffusion ([Dennis Menn, Tianpei Gu, Guande He, Aryan V S, Yanke Song, Nan Liu, Desai Xie, Xun Huang, Chenfeng Xu and Diana Marculescu, arXiv 2611.12069](https://arxiv.org/abs/2611.12069)) generates the visually important region at high resolution (HR) and the rest at low resolution (LR). Their sampler (Sec. 4) has four stages:
 
 1. The first `k` of `T` steps denoise the whole video at LR.
 2. At step `k`, a linear head `s = wᵀ LN(h)` on a middle block picks the HR region `M`.
@@ -81,7 +81,7 @@ Order of value for faces: (1) is free and helps at once; (2) is what lets the HR
 ## Quick start
 
 ```bash
-git clone https://github.com/scrya-com/lot-diffusion && cd lot-diffusion
+git clone https://github.com/scrya-com/mpeg-diffusion && cd mpeg-diffusion
 pip install -r requirements.txt
 hf download Comfy-Org/MiniMax-H3 diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors --local-dir models
 export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
@@ -106,8 +106,8 @@ All paths are environment variables; [`lot/lot_paths.py`](lot/lot_paths.py) list
 
 ## References
 
-- Nakayama et al., **Level-of-Token Diffusion**, [arXiv 2610.05816](https://arxiv.org/abs/2610.05816). The method this repository implements.
-- Menn, Gu, He, V S, Song, Liu, Xie, Huang (Roblox), Xu and Marculescu (UT Austin), **MPEG-Diffusion: Mixed-Resolution Video Generation**, [arXiv 2611.12069](https://arxiv.org/abs/2611.12069). Source of the dual-resolution attention, region head and mixed-resolution sampler in `lot/mixed_res.py` and `lot/two_track_h3.py`.
+- Kiyohiro Nakayama, Brian Chao, Jan Ackermann, Hansheng Chen, Federico Tombari, Leonidas Guibas, Lior Yariv and Gordon Wetzstein, **Level-of-Token Diffusion**, [arXiv 2610.05816](https://arxiv.org/abs/2610.05816). The method this repository implements.
+- Dennis Menn, Tianpei Gu, Guande He, Aryan V S, Yanke Song, Nan Liu, Desai Xie, Xun Huang, Chenfeng Xu and Diana Marculescu (UT Austin, Roblox), **MPEG-Diffusion: Mixed-Resolution Video Generation**, [arXiv 2611.12069](https://arxiv.org/abs/2611.12069). Source of the dual-resolution attention, region head and mixed-resolution sampler in `lot/mixed_res.py` and `lot/two_track_h3.py`.
 - [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner), the H3 runtime vendored in `third_party/`.
 
 Cite the papers above, not this repository.
