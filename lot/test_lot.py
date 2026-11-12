@@ -708,10 +708,42 @@ def test_layout_sources():
     tl = texture_layout(image, 1, 24, 16, fine_q=0.5, mid_q=0.3)
     assert {r.extent for r in tl.rects if r.v < 6} == {(1, 1, 1)}
     assert (1, 4, 4) in {r.extent for r in tl.rects if r.v >= 10}
-    # odd grids: edges stay 1x1 and every token is covered exactly once
+    # odd grids: every token is covered exactly once, and edge cells coarsen as clipped rectangles
     odd = layout_from_desired_any(torch.full((2, 19, 30), 4))
     assert odd.dense_count == 2 * 19 * 30
+    assert {r.extent for r in odd.rects} <= set(H3_EXTENTS)
+    assert (1, 4, 2) in {r.extent for r in odd.rects if r.v == 28}      # 30 = 7*4 + 2
     assert to_latent_frames(torch.rand(5, 3, 3), 2).shape == (2, 3, 3)
+
+
+def test_layouts_any_grid():
+    """H3's 1344x768 is 24x42 tokens: 42 is not a multiple of 4 or 8. Every layout source tiles it."""
+    import random as _random
+    from layout import layout_from_desired, layout_from_detail
+    from train_h3 import _spans, _tile, sample_layout
+
+    assert _spans(0, 3, 4) == [(0, 2), (2, 1)] and _spans(8, 4, 2) == [(8, 2), (10, 2)]
+    for height, width in ((24, 42), (19, 30), (5, 3), (1, 1)):
+        for extent in H3_EXTENTS:
+            tiled = _tile(1, height, width, lambda *_: extent)
+            assert tiled.dense_count == height * width
+            assert {r.extent for r in tiled.rects} <= set(H3_EXTENTS)
+        for root in (2, 4, 8):
+            squares = layout_from_desired(torch.full((1, height, width), 8), root=root)
+            assert all(r.eh == r.ew for r in squares.rects)                   # default: squares only
+            edges = layout_from_desired(torch.full((1, height, width), 8), root=root, edge_rects=True)
+            assert edges.count <= squares.count
+            assert layout_from_detail(torch.rand(1, height, width), {8: 0.1, 4: 0.3, 2: 0.6},
+                                      root=root, edge_rects=True).dense_count == height * width
+    strip = _tile(1, 24, 42, lambda *_: (1, 4, 4))
+    assert {r.extent for r in strip.rects if r.v == 40} == {(1, 4, 2)}       # the 2-token strip
+    assert strip.count == 6 * 10 + 6
+    torch.manual_seed(3)
+    latent = torch.randn(1, 24, 2, 48, 84)                                  # 768x1344, 2 latent frames
+    for name in ("dense", "uniform", "mosaic", "box", "focus", "texture", "eval_mosaic"):
+        layout, _kind = sample_layout(latent, _random.Random(2), force=name)
+        assert (layout.time, layout.height, layout.width) == (2, 24, 42)
+        assert {r.extent for r in layout.rects} <= set(H3_EXTENTS)
 
 
 def main():
@@ -744,6 +776,7 @@ def main():
         test_torch_eq9_matches_lakonlab,
         test_grid_layouts_any_shape,
         test_layout_sources,
+        test_layouts_any_grid,
     ]
     for test in tests:
         test()

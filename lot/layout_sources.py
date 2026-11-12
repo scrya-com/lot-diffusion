@@ -55,14 +55,14 @@ def to_latent_frames(field: torch.Tensor, latent_t: int, reduce: str = "max") ->
 
 
 def layout_from_desired_any(desired: torch.Tensor) -> LotLayout:
-    """Quadtree (4 → 2 → 1) for any ``(T, H, W)`` grid; edges that do not fill a 4×4 cell stay 1×1."""
-    desired = desired.long().clamp(1, 4)
-    time, height, width = desired.shape
-    pad_h, pad_w = (-height) % 4, (-width) % 4
-    padded = F.pad(desired, (0, pad_w, 0, pad_h), value=1)
-    full = layout_from_desired(padded, root=4)
-    rects = [r for r in full.rects if r.u + r.eh <= height and r.v + r.ew <= width]
-    return LotLayout(time, height, width, tuple(rects))
+    """Quadtree (4 → 2 → 1) for any ``(T, H, W)`` grid.
+
+    A 4×4 cell cut by the far edge keeps the clipped rectangle when its cells
+    allow it (4×2 on the 2-token strip of H3's 24×42, 2×4 on a 2-row strip), so
+    edges coarsen like the interior instead of falling back to 1×1. Every
+    clipped extent is in H3's bank (FINE + MID + COARSE).
+    """
+    return layout_from_desired(desired.long().clamp(1, 4), root=4, edge_rects=True)
 
 
 def desired_from_levels(fine: torch.Tensor, mid: torch.Tensor | None, background: int) -> torch.Tensor:

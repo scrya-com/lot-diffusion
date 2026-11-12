@@ -30,7 +30,7 @@ Data: one or more H3 cache directories from ``build_cache_h3.py`` (``--cache``, 
 ``*_minimaxh3.safetensors`` latents with ``*_minimaxh3_te.safetensors`` text,
 so Qwen is never loaded here. Stills are ``(24, H, W)``; clips are
 ``(24, T, H, W)`` (cache 384×640, 22 frames for ``latent_t = 7``). Each latent
-is randomly cropped to a token grid divisible by 4. ``--init DIR`` warm-starts
+is randomly cropped to whole 2×2 patches (any token grid: layouts clip at the edges). ``--init DIR`` warm-starts
 the adapter and LoRA from an earlier run's ``adapter.pt`` / ``lora.safetensors``
 with a fresh optimizer.
 
@@ -122,7 +122,7 @@ def load_item(item, rng: random.Random, device) -> tuple[torch.Tensor, torch.Ten
         mask = handle.get_tensor("attention_mask")
     if latent.ndim == 3:
         latent = latent.unsqueeze(1)                      # (24, 1, H, W)
-    step = 2 * SUPER                                       # latent pixels per super-cell
+    step = 2                                               # one 2×2 patch; layouts tile any token grid
     height, width = latent.shape[-2] // step * step, latent.shape[-1] // step * step
     if MAX_LATENT_HW is not None:
         height = min(height, MAX_LATENT_HW[0] // step * step)
@@ -146,12 +146,20 @@ def load_adapter_state(run_dir: Path) -> dict:
 # -------------------------------------------------------------------------------- layout
 
 def token_detail(latent: torch.Tensor) -> torch.Tensor:
-    """``(T, H, W)`` detail per token: distance from its 4×4-cell mean, on the clean latent."""
+    """``(T, H, W)`` detail per token: distance from its 4×4-cell mean, on the clean latent.
+
+    Cells cut by the far edge average only the tokens inside the grid."""
     tokens = patchify(latent.float())[0]                   # (T, H, W, 96)
     grid = tokens.permute(0, 3, 1, 2)                       # (T, 96, H, W)
-    coarse = F.avg_pool2d(grid, SUPER)
-    coarse = F.interpolate(coarse, scale_factor=SUPER, mode="nearest")
+    height, width = grid.shape[-2:]
+    coarse = cell_mean(grid)
+    coarse = coarse.repeat_interleave(SUPER, -2).repeat_interleave(SUPER, -1)[..., :height, :width]
     return (grid - coarse).norm(dim=1)
+
+
+def cell_mean(grid: torch.Tensor) -> torch.Tensor:
+    """Mean over 4×4 super-cells of ``(..., H, W)``; edge cells average only their in-grid part."""
+    return F.avg_pool2d(grid, SUPER, ceil_mode=True)
 
 
 DEFAULT_MIX = {"uniform": 0.10, "mosaic": 0.15, "box": 0.20, "focus": 0.20, "texture": 0.15}
@@ -272,7 +280,7 @@ def _legacy_mosaic(latent: torch.Tensor, rng: random.Random, dense_p: float,
         extent = rng.choice(MID + COARSE)
         return _tile(time, height, width, lambda _t, _u, _v: extent), "uniform"
     detail = token_detail(latent).cpu()
-    cells = F.avg_pool2d(detail.unsqueeze(1), SUPER).squeeze(1)    # (T, H/4, W/4)
+    cells = cell_mean(detail.unsqueeze(1)).squeeze(1)              # (T, ceil(H/4), ceil(W/4))
     flat = cells.flatten()
     low_q, high_q = sorted((rng.uniform(0.2, 0.6), rng.uniform(0.5, 0.9)))
     low, high = float(flat.quantile(low_q)), float(flat.quantile(high_q))
@@ -288,15 +296,31 @@ def _legacy_mosaic(latent: torch.Tensor, rng: random.Random, dense_p: float,
     return _tile(time, height, width, pick), "mosaic"
 
 
+def _spans(start: int, length: int, step: int) -> list[tuple[int, int]]:
+    """``(offset, size)`` pieces covering ``[start, start + length)``: ``step`` while it fits,
+    then the remainder in descending powers of two (3 -> 2 + 1)."""
+    pieces, pos, end = [], start, start + length
+    while pos < end:
+        size = step
+        while size > end - pos:
+            size //= 2
+        pieces.append((pos, size))
+        pos += size
+    return pieces
+
+
 def _tile(time: int, height: int, width: int, choose) -> LotLayout:
+    """One extent per 4×4 super-cell. Cells cut by the far edge tile their remainder with the
+    largest power-of-two pieces that fit (a 4×4 choice is 4×2 on a 2-token strip), so any
+    grid works, e.g. H3's 1344×768 (24×42 tokens). Every piece is in H3's bank."""
     rects = []
     for t in range(time):
         for u0 in range(0, height, SUPER):
             for v0 in range(0, width, SUPER):
                 _et, eh, ew = choose(t, u0, v0)
-                for u in range(u0, u0 + SUPER, eh):
-                    for v in range(v0, v0 + SUPER, ew):
-                        rects.append(TokenRect(t, u, v, 1, eh, ew))
+                for u, ph in _spans(u0, min(SUPER, height - u0), eh):
+                    for v, pw in _spans(v0, min(SUPER, width - v0), ew):
+                        rects.append(TokenRect(t, u, v, 1, ph, pw))
     return layout_from_rects(time, height, width, rects)
 
 
