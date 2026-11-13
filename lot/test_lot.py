@@ -946,6 +946,90 @@ def test_two_track_decoder_and_pairs():
     assert pixels_to_tokens(pixels, 0)[0].nonzero().tolist() == [[1, 10], [2, 10]]
 
 
+def test_pyramid_levels():
+    """DRAFT lot/pyramid.py: L nested levels; L = 2 is two_track_attention; planning numbers."""
+    from mixed_res import TwoTrackPlan, UpMaps, _rope, _sdpa, two_track_attention
+    from pyramid import PyramidPlan, attention_cost, max_levels, pyramid_attention, token_share
+
+    torch.manual_seed(0)
+    heads, dim, text = 2, 8, 3
+    inner = heads * dim
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_heads, self.head_dim, self.inner_dim = heads, dim, inner
+            self.qkv_proj = torch.nn.Linear(inner, 3 * inner, bias=False)
+            self.q_norm = self.k_norm = torch.nn.Identity()
+            self.out_proj = torch.nn.Identity()
+
+    attn = Attn()
+
+    def table(count):
+        angle = torch.rand(1, count, 1, dim // 2)
+        cos, sin = angle.cos(), angle.sin()
+        return torch.stack((torch.stack((cos, -sin), -1), torch.stack((sin, cos), -1)), -2)
+
+    def plain(hidden, rotation):
+        q, k, v = attn.qkv_proj(hidden).split(inner, dim=-1)
+        shape = (1, hidden.shape[1], heads, dim)
+        return _sdpa(_rope(q.reshape(shape), rotation), _rope(k.reshape(shape), rotation), v.reshape(shape))
+
+    # 1. Two levels are MPEG-Diffusion's two tracks, with copy maps and with fitted ones.
+    mask = torch.zeros(1, 3, 5, dtype=torch.bool)
+    mask[0, 1, 1:4] = True
+    two, pyr = TwoTrackPlan(mask), PyramidPlan((1, 3, 5), [mask])
+    assert pyr.counts == [15, 12] and torch.equal(pyr.index[1], two.hr_index) and torch.equal(pyr.orders[1], two.cell_order)
+    hidden = torch.randn(1, text + 15 + 12, inner)
+    rotation, grid = table(hidden.shape[1]), table(60)
+    maps = UpMaps(1, dim, [(1, 2, 2)], rank=4)
+    with torch.no_grad():
+        maps.up["l0_2x2_k"].normal_()
+    for m in (None, maps):
+        want = two_track_attention(attn, hidden, rotation, layer=0, plan=two, maps=m, video_start=text, hr_rotation=grid)
+        got = pyramid_attention(attn, hidden, rotation, layer=0, plan=pyr, maps=None if m is None else [m],
+                                video_start=text, grid_rotations=[grid])
+        assert torch.allclose(got, want, atol=1e-6)
+
+    # 2. Three levels, everything refined: the finest rows are the plain model on [text, finest grid].
+    full = PyramidPlan((1, 2, 3), [torch.ones(1, 2, 3, dtype=torch.bool), torch.ones(1, 4, 6, dtype=torch.bool)])
+    assert full.counts == [6, 24, 96] and full.grid_counts == [6, 24, 96]
+    hidden = torch.randn(1, text + 6 + 24 + 96, inner)
+    rotation = table(hidden.shape[1])
+    grids = [rotation[:, text + 6:text + 30], rotation[:, text + 30:]]
+    out = pyramid_attention(attn, hidden, rotation, layer=0, plan=full, maps=None, video_start=text, grid_rotations=grids)
+    keep = torch.cat([torch.arange(text), torch.arange(text + 30, hidden.shape[1])])
+    assert torch.allclose(out[:, text + 30:], plain(hidden[:, keep], rotation[:, keep])[:, text:], atol=1e-5)
+
+    # 3. Nested three levels: coarse rows never see finer rows; level 1 never sees level 2.
+    m1 = torch.zeros(1, 2, 3, dtype=torch.bool)
+    m1[0, :, 1:] = True
+    m2 = torch.zeros(1, 4, 6, dtype=torch.bool)
+    m2[0, 1:3, 3:5] = True
+    plan = PyramidPlan((1, 2, 3), [m1, m2])
+    assert plan.counts == [6, 16, 16]
+    hidden = torch.randn(1, text + sum(plan.counts), inner)
+    rotation, grids = table(hidden.shape[1]), [table(24), table(96)]
+    base = pyramid_attention(attn, hidden, rotation, layer=0, plan=plan, maps=None, video_start=text, grid_rotations=grids)
+    moved = hidden.clone()
+    moved[:, text + 6 + 16:] += 1.0
+    again = pyramid_attention(attn, moved, rotation, layer=0, plan=plan, maps=None, video_start=text, grid_rotations=grids)
+    assert torch.allclose(again[:, :text + 22], base[:, :text + 22], atol=1e-6)
+    assert not torch.allclose(again[:, text + 22:], base[:, text + 22:], atol=1e-4)
+    try:
+        PyramidPlan((1, 2, 3), [m1, torch.ones(1, 4, 6, dtype=torch.bool)])   # refines tokens level 1 lacks
+        raise AssertionError("nesting not enforced")
+    except ValueError:
+        pass
+
+    # 4. Planning numbers: 1344x768 (24x42 tokens) fits two levels, 2688x1536 three.
+    assert max_levels(24, 42) == 2 and max_levels(48, 84) == 3
+    assert abs(token_share([1.0, 0.25]) - 0.5) < 1e-9 and abs(token_share([1.0, 0.5, 0.15]) - 0.3375) < 1e-9
+    cost = attention_cost(plan, prefix=10)
+    assert cost["tokens"] == 38 and cost["finest_queries_keys"] == 106
+    assert cost["pairs"] == 16 ** 2 + 16 * 34 + 16 * 106
+
+
 def test_region_head_and_mixer():
     """MPEG-Diffusion's self-selected region (mixed_res.region_*) and seam mixer."""
     from layout import dense_layout
@@ -1026,6 +1110,7 @@ def main():
         test_dual_kv_attention,
         test_two_track_attention,
         test_two_track_decoder_and_pairs,
+        test_pyramid_levels,
         test_region_head_and_mixer,
     ]
     for test in tests:
