@@ -106,10 +106,10 @@ class SubjectSegmenter:
     """Main subject: YOLO instance masks of any of its 80 classes, preferring classes the caption names,
     ranked by confidence, size and centrality; same-class instances close to the best are kept too."""
 
-    def __init__(self, model: str, conf: float = 0.35):
+    def __init__(self, model: str, conf: float = 0.35, center: float = 0.8):
         from ultralytics import YOLO
 
-        self.model, self.conf = YOLO(model), conf
+        self.model, self.conf, self.center = YOLO(model), conf, center
         self.names = self.model.names
 
     def words(self, caption: str) -> set[str]:
@@ -140,7 +140,7 @@ class SubjectSegmenter:
             if area == 0:
                 return 0.0
             cy, cx = yy[masks[i]].mean() / height - 0.5, xx[masks[i]].mean() / width - 0.5
-            return confs[i] * area ** 0.5 * (1.0 - 0.8 * (cy * cy + cx * cx) ** 0.5)
+            return confs[i] * area ** 0.5 * (1.0 - self.center * (cy * cy + cx * cx) ** 0.5)
 
         best = max(pool, key=score)
         keep = [i for i in pool if classes[i] == classes[best] and score(i) >= 0.5 * score(best)]
@@ -190,6 +190,46 @@ class YoloeSubject:
         return out[:self.max_words] or ["person"]
 
     def mask(self, rgb: np.ndarray, caption: str = "") -> tuple[np.ndarray, str]:
+        """Every person in the frame, plus the best instance of a non-person thing the caption names.
+
+        People always count (where viewers look); position does not (no centrality term), so the
+        head cannot learn "the subject is in the middle" from the labels."""
+        height, width = rgb.shape[:2]
+        named = self.candidates(caption)
+        names = ["person"] + [n for n in named if n != "person"]
+        result, masks, classes, confs = self._detect(rgb, names)
+        if not classes:
+            return (self.fallback.mask(rgb, caption) if self.fallback is not None
+                    else (np.zeros((height, width), dtype=bool), ""))
+        people = [i for i, c in enumerate(classes) if c == "person" and masks[i].any()]
+        things = [i for i, c in enumerate(classes) if c != "person" and 0 < masks[i].mean() <= 0.35]
+
+        def score(i: int) -> float:
+            return confs[i] * masks[i].mean() ** 0.5 * (1.0 - 0.08 * names.index(classes[i]))
+
+        keep = list(people)
+        label = "person" if people else ""
+        if things:
+            best = max(things, key=score)
+            keep.append(best)
+            label = f"{label}+{classes[best]}" if label else classes[best]
+        if not keep:
+            return (self.fallback.mask(rgb, caption) if self.fallback is not None
+                    else (np.zeros((height, width), dtype=bool), ""))
+        return np.any(masks[keep], axis=0), label
+
+    def _detect(self, rgb: np.ndarray, names: list[str]):
+        if names != self._names:
+            self.model.set_classes(names, self.model.get_text_pe(names))
+            self._names = names
+        result = self.model.predict(rgb[:, :, ::-1], conf=self.conf, verbose=False, retina_masks=True)[0]
+        if result.masks is None or len(result.boxes) == 0:
+            return result, None, [], []
+        masks = result.masks.data.cpu().numpy().astype(bool)
+        return result, masks, [names[int(c)] for c in result.boxes.cls.tolist()], result.boxes.conf.tolist()
+
+    def mask_v1(self, rgb: np.ndarray, caption: str = "") -> tuple[np.ndarray, str]:
+        """The first rule (one best subject, centrality-weighted); kept for comparison."""
         height, width = rgb.shape[:2]
         names = self.candidates(caption)
         if names != self._names:
@@ -296,6 +336,10 @@ def main() -> None:
                         help="yolo: people only; main: the main subject, any of YOLO's 80 classes, caption-guided; "
                              "yoloe: open-vocabulary YOLOE prompted with the caption's words (falls back to main)")
     parser.add_argument("--yoloe-model", default="yoloe-11s-seg.pt")
+    parser.add_argument("--photos", type=Path, action="append", default=None,
+                        help="relabel: folders of the source photos (cover-resized and centre-cropped like "
+                             "build_cache_h3.py media), used instead of decoding each latent")
+    parser.add_argument("--tag", default=None, help="relabel: tag written to index entries (resume key)")
     parser.add_argument("--relabel", action="store_true",
                         help="recompute face/subject masks of existing pairs in --out (no re-encoding)")
     parser.add_argument("--yolo-model", default="yolo11n-seg.pt")
@@ -371,7 +415,40 @@ def make_subjects(args):
     if args.subject == "main":
         return SubjectSegmenter(args.yolo_model)
     if args.subject == "yoloe":
-        return YoloeSubject(args.yoloe_model, fallback=SubjectSegmenter(args.yolo_model))
+        return YoloeSubject(args.yoloe_model, fallback=SubjectSegmenter(args.yolo_model, center=0.0))
+    return None
+
+
+class _LazyVae:
+    """Loads the VAE only if some pair has no source photo."""
+
+    def __getattr__(self, name):
+        from two_track_h3 import load_upscaler
+
+        real = load_upscaler()
+        self.__dict__.update(real.__dict__)
+        self.__class__ = type(real)
+        return getattr(real, name)
+
+
+def photo_for(stem: str, dirs: list[Path], width: int, height: int):
+    """The source photo of a cache stem, cover-resized and centre-cropped to ``width x height`` the way
+    ``build_cache_h3.py media`` built the latent, as uint8 RGB; ``None`` if not found."""
+    import re
+
+    from PIL import Image
+
+    base = re.sub(r"_\d{4}x\d{4}$", "", stem)
+    for folder in dirs:
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            path = folder / f"{base}{ext}"
+            if path.is_file():
+                image = Image.open(path).convert("RGB")
+                scale = max(width / image.width, height / image.height)
+                size = (max(width, round(image.width * scale)), max(height, round(image.height * scale)))
+                image = image.resize(size, Image.BICUBIC)
+                left, top = (size[0] - width) // 2, (size[1] - height) // 2
+                return np.asarray(image.crop((left, top, left + width, top + height)))
     return None
 
 
@@ -384,10 +461,11 @@ def relabel(args) -> None:
 
     index_path = args.out / "index.json"
     entries = json.loads(index_path.read_text())
-    vae = load_upscaler()
+    vae = load_upscaler() if not args.photos else _LazyVae()
     faces = FaceDetector(args.detector)
     subjects = make_subjects(args) or SubjectSegmenter(args.yolo_model)
-    tag = "yoloe" if args.subject == "yoloe" else "main"
+    tag = args.tag or ("yoloe" if args.subject == "yoloe" else "main")
+    photo_dirs = args.photos or []
     classes: dict[str, int] = {}
     for number, entry in enumerate(entries):
         if entry.get("relabel") == tag and not args.items:
@@ -395,9 +473,12 @@ def relabel(args) -> None:
         path = args.out / entry["pair"]
         with safe_open(str(path), "pt") as handle:
             tensors = {k: handle.get_tensor(k) for k in handle.keys()}
-        with torch.no_grad():
-            pixels = vae.vae.decode(tensors["hr"][None].cuda().to(vae.dtype))[0, :, 0].float().clamp(-1, 1)
-        rgb = ((pixels.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).round().astype(np.uint8)
+        height, width = tensors["hr"].shape[-2] * 16, tensors["hr"].shape[-1] * 16
+        rgb = photo_for(entry["stem"], photo_dirs, width, height)
+        if rgb is None:
+            with torch.no_grad():
+                pixels = vae.vae.decode(tensors["hr"][None].cuda().to(vae.dtype))[0, :, 0].float().clamp(-1, 1)
+            rgb = ((pixels.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).round().astype(np.uint8)
         face = boxes_to_tokens(faces.boxes(rgb), rgb.shape[0], rgb.shape[1], args.grow)
         pixel_mask, name = subjects.mask(rgb, caption_for(entry["te"]))
         subject = pixels_to_tokens(pixel_mask, args.subject_grow)

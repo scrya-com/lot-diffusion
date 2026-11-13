@@ -246,11 +246,31 @@ def train_region(args) -> None:
     switches = args.switches or [args.switch]
     schedule = sigma_schedule(args.steps_schedule)
 
-    def collect(entries, offset):
+    def augment(pair, rng):
+        """Random off-centre crop and horizontal flip of the LR latent and its masks, so the subject's
+        position stops predicting the label (the first head learned "the subject is in the middle")."""
+        if rng.random() >= args.crop_aug:
+            return pair
+        lr, face, subject = pair["lr"], pair["face"], pair["subject"]
+        tok_h, tok_w = face.shape[-2:]
+        crop_h = max(4, round(tok_h * rng.uniform(0.7, 1.0)))
+        crop_w = max(4, round(tok_w * rng.uniform(0.5, 0.85)))
+        top, left = rng.randint(0, tok_h - crop_h), rng.randint(0, tok_w - crop_w)
+        rows, cols = slice(top, top + crop_h), slice(left, left + crop_w)
+        lr = lr[..., 2 * top:2 * (top + crop_h), 2 * left:2 * (left + crop_w)]
+        face, subject = face[:, rows, cols], subject[:, rows, cols]
+        if rng.random() < 0.5:
+            lr, face, subject = lr.flip(-1), face.flip(-1), subject.flip(-1)
+        return {**pair, "lr": lr.contiguous(), "face": face.contiguous(), "subject": subject.contiguous()}
+
+    def collect(entries, offset, train_set=True):
         out = []
+        rng = random.Random(args.seed + offset)
         with torch.no_grad():
             for number, entry in enumerate(entries):
                 pair = load_pair(entry)
+                if train_set:
+                    pair = augment(pair, rng)
                 sigma = float(schedule[switches[number % len(switches)] - 1])
                 gen = torch.Generator("cuda").manual_seed(offset + number)
                 x_lr = (1.0 - sigma) * pair["lr"] + sigma * torch.randn(pair["lr"].shape, device="cuda", generator=gen)
@@ -273,7 +293,7 @@ def train_region(args) -> None:
               flush=True)
     else:
         pairs = collect(train[:args.items], 0)
-        held_pairs = collect(held, 10_000)
+        held_pairs = collect(held, 10_000, train_set=False)
         del dit
         torch.cuda.empty_cache()
         if args.features is not None:
@@ -484,6 +504,8 @@ def main() -> None:
     parser.add_argument("--features", type=Path, default=None,
                         help="region: phase-1 features file; written after collection, reused when it exists")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="region: Adam weight decay on the head")
+    parser.add_argument("--crop-aug", type=float, default=0.0,
+                        help="region: share of training pairs given a random off-centre crop + flip (0.7 recommended)")
     parser.add_argument("--switches", type=int, nargs="+", default=None,
                         help="region: train one head for several switch steps (cycled over the pairs)")
     parser.add_argument("--epochs", type=int, default=20)
