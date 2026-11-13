@@ -281,7 +281,7 @@ def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_a
 @torch.no_grad()
 def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, maps=None, head=None, box=None,
                      block=MID_BLOCK, alpha=0.5, floor=None, feather=0.0, on_mask=None, hr_steps=None,
-                     res_embed=None, decoder=None, latent_t=1, switch_upscale="vae"):
+                     res_embed=None, decoder=None, latent_t=1, switch_upscale="vae", final="latent"):
     """The four-stage sampler of the module docstring. Returns ``(latent, info)`` at ``width x height``.
 
     ``decoder`` is ``(U, G)`` from ``train_tt.py decoder``: ``U`` replaces the VAE upscale (at the
@@ -320,8 +320,17 @@ def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, 
     sigma = float(sigmas[switch])
     # At the switch the HR latent is mostly noise (sigma 0.75 at 16 of 20 on shift 12), so a latent x2 interpolation
     # can stand in for the VAE round trip (5 s for 7 latent frames on a 5090): switch_upscale="latent".
-    start = up(x0_lr) if switch_upscale == "vae" else F.interpolate(
-        x0_lr.float(), scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+    # switch_upscale="crop": the HR track only reads U(x0_lr) inside M, so round-trip just M's bounding box
+    # (all frames, plus a margin) and fill the rest with a latent x2.
+    if switch_upscale == "vae":
+        start = up(x0_lr)
+    else:
+        start = F.interpolate(x0_lr.float(), scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+        if switch_upscale == "crop":
+            box_lr = crop_box(mask, lat_h, lat_w, margin=2)
+            if box_lr is not None:
+                y0, y1, x0, x1 = box_lr
+                start[..., 2 * y0:2 * y1, 2 * x0:2 * x1] = up(x0_lr[..., y0:y1, x0:x1].contiguous())
     hr = (1.0 - sigma) * start + sigma * torch.randn(1, 24, latent_t, 2 * lat_h, 2 * lat_w, device="cuda",
                                                               generator=gen)
     # After the switch both tracks share the schedule: the model's own, or ``hr_steps`` steps
@@ -347,8 +356,49 @@ def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, 
         latent = mixer(hr, upscaler(filled), mask_to_latent(mask, 4).to("cuda"))
         return latent, {"mask": mask, "tokens": tokens}
     weight = mask_to_latent(mask, 4, feather).to("cuda")
+    if final == "pixel":
+        # No round trip at the end: the caller decodes HR (outside M filled with a latent x2 of LR, so the
+        # VAE sees a plausible neighbourhood at the edge) and LR at half size, and pastes in pixel space.
+        inside = mask_to_latent(mask, 4).to("cuda")
+        context = F.interpolate(lr.float(), scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+        return inside * hr + (1.0 - inside) * context, {"mask": mask, "tokens": tokens, "lr": lr, "weight": weight}
     latent = weight * hr + (1.0 - weight) * upscale(lr)
     return latent, {"mask": mask, "tokens": tokens}
+
+
+def crop_box(mask: torch.Tensor, lat_h: int, lat_w: int, margin: int = 2):
+    """Union over frames of M's bounding box on the LR latent grid (one LR token = 2 latent px), grown by
+    ``margin`` latent px and rounded out to even sides, as ``(y0, y1, x0, x1)``; None for an empty mask."""
+    rows = torch.nonzero(mask.any(0).any(1)).flatten()
+    cols = torch.nonzero(mask.any(0).any(0)).flatten()
+    if not len(rows):
+        return None
+    y0, y1 = max(0, 2 * int(rows[0]) - margin), min(lat_h, 2 * int(rows[-1]) + 2 + margin)
+    x0, x1 = max(0, 2 * int(cols[0]) - margin), min(lat_w, 2 * int(cols[-1]) + 2 + margin)
+    y0, x0 = y0 - y0 % 2, x0 - x0 % 2
+    y1, x1 = min(lat_h, y1 + y1 % 2), min(lat_w, x1 + x1 % 2)
+    return y0, y1, x0, x1
+
+
+def pixel_compose(vae, hr_latent: torch.Tensor, lr_latent: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Decode HR and LR, upscale the LR pixels x2 (bicubic, per frame), paste with ``weight`` (HR latent grid,
+    ``(1, 1, T, H, W)``) mapped to pixels: x16 in space, each latent frame to the pixel frames it decodes to."""
+    from h3_musubi import pixel_frames
+
+    dtype = next(vae.parameters()).dtype
+    hr_px = vae.decode(hr_latent.to("cuda", dtype)).float().clamp(-1, 1)
+    lr_px = vae.decode(lr_latent.to("cuda", dtype)).float().clamp(-1, 1)
+    if hr_latent.shape[2] == 1:
+        hr_px, lr_px = hr_px[:, :, :1], lr_px[:, :, :1]
+    b, c, f, h, w = lr_px.shape
+    lr_up = F.interpolate(lr_px.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w), scale_factor=2, mode="bicubic",
+                          align_corners=False).clamp(-1, 1)
+    lr_up = lr_up.reshape(b, f, c, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
+    frame_of = [k for k in range(hr_latent.shape[2]) for _ in range(pixel_frames(k + 1) - pixel_frames(k))]
+    frame_of = torch.tensor((frame_of + [frame_of[-1]] * f)[:hr_px.shape[2]], device=weight.device)
+    w_px = F.interpolate(weight[0, 0][:, None].float(), scale_factor=16, mode="bilinear", align_corners=False)
+    w_px = w_px[frame_of][:, 0][None, None]                                  # (1, 1, F, H, W)
+    return w_px * hr_px + (1.0 - w_px) * lr_up
 
 
 # -------------------------------------------------------------------------- phases
@@ -491,14 +541,21 @@ def render(args) -> None:
                     dit, embeds, upscale, height=height, width=width, steps=args.steps, switch=args.switch,
                     seed=args.seed + index, maps=maps, head=head, box=args.box, block=args.block,
                     alpha=args.alpha, floor=args.floor, feather=args.feather, hr_steps=args.hr_steps,
-                    res_embed=res_embed, decoder=decoder, latent_t=latent_t, switch_upscale=args.switch_upscale)
+                    res_embed=res_embed, decoder=decoder, latent_t=latent_t, switch_upscale=args.switch_upscale,
+                    final=args.final)
                 mask = info["mask"]
                 count = sum(info["tokens"]) / len(info["tokens"])
                 meta["hr_share"].append(round(float(mask.float().mean()), 4))
             torch.cuda.synchronize()
             meta["timings"][name].append(round(time.perf_counter() - start, 2))
             meta["tokens"][name].append(round(count, 1))
-            pixels = upscale.vae.decode(latent.to("cuda", upscale.dtype))
+            if name == "two_track" and args.final == "pixel" and "lr" in info:
+                pixels = pixel_compose(upscale.vae, latent, info["lr"], info["weight"])
+                torch.cuda.synchronize()
+                meta["timings"][name][-1] = round(time.perf_counter() - start, 2)   # the composite decodes: count it
+                meta.setdefault("note", "two_track timing with --final pixel includes its decode; others exclude decode")
+            else:
+                pixels = upscale.vae.decode(latent.to("cuda", upscale.dtype))
             if latent_t > 1:
                 save_clip(pixels, args.out / f"p{index}_{name}.mp4")
                 pixels = pixels[:, :, pixels.shape[2] // 2:pixels.shape[2] // 2 + 1]       # the grid shows the middle frame
@@ -796,8 +853,12 @@ def main() -> None:
     parser.add_argument("--hr-steps", type=int, default=6,
                         help="steps after the switch, linear in sigma (0: the rest of the schedule)")
     parser.add_argument("--size", type=int, nargs=2, default=(1344, 768), metavar=("W", "H"))
-    parser.add_argument("--switch-upscale", choices=("vae", "latent"), default="vae",
-                        help="render: HR start at the switch: VAE round trip, or latent x2 interpolation (no VAE)")
+    parser.add_argument("--switch-upscale", choices=("vae", "crop", "latent"), default="vae",
+                        help="render: HR start at the switch: VAE round trip of the frame, of M's bounding box only "
+                             "(crop), or latent x2 interpolation (no VAE; striped regions)")
+    parser.add_argument("--final", choices=("latent", "pixel"), default="latent",
+                        help="render: merge the tracks in latent space (a VAE round trip of LR) or in pixel space "
+                             "(decode LR at half size, paste after decoding)")
     parser.add_argument("--frames", type=int, default=1,
                         help="render: pixel frames (1 = still; 22 = 7 latent frames). Clips also save p<i>_<variant>.mp4")
     parser.add_argument("--variants", default="hr,lr,two_track")
