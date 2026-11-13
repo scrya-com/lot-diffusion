@@ -44,6 +44,17 @@ def convert_state(src: Path, dst: Path) -> None:
                                "hidden": str(saved["hidden"]), "format": "two_track_h3.tt_state"})
 
 
+def convert_region(src: Path, dst: Path) -> dict:
+    """``region_head_tt.pt`` -> safetensors with ``hidden`` / ``block`` / ``switch`` metadata; returns its info."""
+    from safetensors.torch import save_file
+
+    saved = torch.load(src, map_location="cpu", weights_only=False)
+    info = {k: saved.get(k) for k in ("hidden", "block", "switch", "steps", "label", "held_miou")}
+    save_file({k: v.contiguous() for k, v in saved["state"].items()}, str(dst),
+              {k: str(v) for k, v in info.items() if v is not None})
+    return info
+
+
 def evals(log: Path) -> list[dict]:
     rows = []
     for line in log.read_text().splitlines():
@@ -52,13 +63,20 @@ def evals(log: Path) -> list[dict]:
     return rows
 
 
-def card(repo: str, folder: str, tags: list[str], log: Path, steps_total: int, data: str) -> str:
+def card(repo: str, folder: str, tags: list[str], log: Path, steps_total: int, data: str, region: dict | None = None) -> str:
     rows = evals(log)
     table = "\n".join(f"| {r['step']} | {r['eval_lr']:.4f} | {r['eval_hr']:.4f} |" for r in rows) or "| — | — | — |"
     last = max((json.loads(l)["step"] for l in log.read_text().splitlines() if '"loss"' in l), default=0)
     files = "\n".join(f"- `lora{t}.safetensors` + `tt_state{t}.safetensors` (step {t[1:] if t else 'final'})"
                       for t in tags)
     status = "finished" if "" in tags else f"in progress (step {last} of {steps_total})"
+    if region is not None:
+        files += (f"\n- `region_head_tt.safetensors`: the self-selected region head (their Sec. 4.3), a linear layer on "
+                  f"block {region['block']}'s LR states at switch step {region['switch']} of {region['steps']}, "
+                  f"trained on {region['label']} masks with this LoRA on. Held-out mIoU {float(region['held_miou']):.3f} "
+                  f"(the paper reports 0.59-0.67 against subject masks).")
+    region_flag = " --region weights/{folder}/region_head_tt.safetensors".format(folder=folder) if region else \
+        " --box 0.3 0.15 0.7 0.9"
     base = f"https://huggingface.co/{repo}/blob/main"
     return f"""# MiniMax H3 two-track (MPEG-Diffusion) LoRA, run 1
 
@@ -90,7 +108,7 @@ qkv / out / fc1 / fc2, the `f_up` K/V maps (ridge-initialised, then trained) and
 git clone {CODE} && cd mpeg-diffusion
 hf download {repo} --include "{folder}/*" --local-dir weights
 python3 lot/two_track_h3.py render --out out --train weights/{folder} --switch 12 --hr-steps 0 \\
-    --box 0.3 0.15 0.7 0.9 --outline            # add --tag _1000 for a checkpoint
+   {region_flag} --outline
 ```
 
 Base: `minimax_h3_fl2va_pruned_int8_convrot.safetensors` from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
@@ -125,8 +143,11 @@ def upload(args, tags: list[str]) -> None:
             shutil.copy(args.lora_dir / f"lora{tag}.safetensors", stage / f"lora{tag}.safetensors")
             convert_state(args.lora_dir / f"tt_state{tag}.pt", stage / f"tt_state{tag}.safetensors")
         shutil.copy(args.lora_dir / "log.jsonl", stage / "train_log.jsonl")
+        region = None
+        if args.region is not None and args.region.is_file():
+            region = convert_region(args.region, stage / "region_head_tt.safetensors")
         (stage / "README.md").write_text(card(args.repo, args.folder, sorted(set(args.done + tags), key=_order),
-                                              args.lora_dir / "log.jsonl", args.steps, args.data))
+                                              args.lora_dir / "log.jsonl", args.steps, args.data, region))
         if args.dry_run is not None:
             shutil.copytree(stage, args.dry_run, dirs_exist_ok=True)
         else:
@@ -166,6 +187,7 @@ def main() -> None:
     parser.add_argument("--watch", action="store_true", help="wait for the final checkpoint, upload, stop")
     parser.add_argument("--all", action="store_true", help="also upload intermediate checkpoints")
     parser.add_argument("--dry-run", type=Path, default=None, help="stage into this dir, upload nothing")
+    parser.add_argument("--region", type=Path, default=None, help="region_head_tt.pt from train_tt.py region, published beside the LoRA")
     parser.add_argument("--poll", type=int, default=120)
     args = parser.parse_args()
     args.done = []

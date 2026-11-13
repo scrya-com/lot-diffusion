@@ -366,6 +366,19 @@ def load_trained(dit, train_dir: Path, tag: str = ""):
     return network, maps.to("cuda").eval(), res_embed.to("cuda").eval()
 
 
+def load_region(path: Path) -> dict:
+    """``region_head_tt.pt`` (as ``train_tt.py region`` saves it) or ``.safetensors`` (as published)."""
+    path = Path(path)
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        with safe_open(str(path), "pt") as handle:
+            meta = handle.metadata() or {}
+        return {"state": load_file(str(path)), "hidden": int(meta["hidden"]), "block": int(meta["block"])}
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 def load_decoder(path: Path):
     from mixed_res import LatentUpscaler, TwoTrackMixer
 
@@ -408,7 +421,7 @@ def render(args) -> None:
     decoder = load_decoder(args.decoder) if args.decoder else None
     head = None
     if args.region:
-        saved = torch.load(args.region, map_location="cpu", weights_only=False)
+        saved = load_region(args.region)
         head = RegionHead(saved["hidden"]).cuda().eval()
         head.load_state_dict(saved["state"])
         args.block = saved["block"]
