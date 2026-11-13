@@ -175,9 +175,109 @@ def ready(args) -> list[str]:
     return sorted(found, key=_order)
 
 
+def region_card(repo: str, folder: str, info: dict, log: Path | None, data: str) -> str:
+    """Model card for a region head published on its own."""
+    import re
+
+    best_line, per = "", ""
+    if log is not None and log.is_file():
+        text = log.read_text()
+        match = re.search(r"tt_region_best epoch=(\d+)", text)
+        if match:
+            line = re.search(rf"tt_region_epoch epoch={match.group(1)} .*", text)
+            best_line = line.group(0) if line else ""
+        else:                                                   # logs before best-epoch selection: last epoch
+            lines = re.findall(r"tt_region_epoch epoch=\d+ .*", text)
+            best_line = lines[-1] if lines else ""
+        pairs = re.findall(r"(class:\w+|switch:\d+)=([0-9.]+)\(n=(\d+)\)", best_line)
+        per = "\n".join(f"| {k.replace('class:', 'subject: ').replace('switch:', 'switch step ')} | {v} | {n} |"
+                         for k, v, n in pairs)
+    base = f"https://huggingface.co/{repo}/blob/main"
+    switches = info.get("switches") or [info.get("switch")]
+    return f"""# Region head: where the subject is, from MiniMax H3's own features
+
+> [!WARNING]
+> **Research checkpoint.** It finds the subject in most test prompts but not all. See *Limits* below.
+> Help and results: [scrya-com/mpeg-diffusion issue #2](https://github.com/scrya-com/mpeg-diffusion/issues/2).
+
+> [!CAUTION]
+> Derived from MiniMax H3 under the [MiniMax H3 Community License]({base}/LICENSE) (see [`NOTICE`]({base}/NOTICE)):
+> use only outside the European Union, the United Kingdom, the Republic of Korea and the United States of America.
+
+The self-selected region of MPEG-Diffusion (Sec. 4.3) by Dennis Menn, Tianpei Gu, Guande He, Aryan V S, Yanke Song,
+Nan Liu, Desai Xie, Xun Huang, Chenfeng Xu and Diana Marculescu (UT Austin and Roblox),
+[arXiv 2611.12069](https://arxiv.org/abs/2611.12069), ported to MiniMax H3. Independent port, not their release.
+
+`s = wᵀ LN(h)`: one linear layer (about 5,400 weights) on block {info.get('block')}'s half-resolution video tokens,
+partway through sampling. It scores each token; smoothing and the paper's threshold `m + α(p − m)` give the region,
+and the region gives a Level-of-Token layout (full-size tokens inside, 2×2 on a ring, 4×4 elsewhere). The DiT is
+frozen; nothing else is trained.
+
+## Files
+
+- `region_head_tt.safetensors`: the head, with `hidden` / `block` / `switch` metadata.
+
+## Use
+
+```bash
+git clone https://github.com/scrya-com/mpeg-diffusion && cd mpeg-diffusion
+hf download {repo} --include "{folder}/*" --local-dir weights
+# Draw what it picks, and the LoT layout that implies, for held-out captions:
+python3 lot/two_track_h3.py layout --region weights/{folder}/region_head_tt.safetensors --out out --switch 10
+# Or let it pick the full-resolution region in two-track sampling:
+python3 lot/two_track_h3.py render --region weights/{folder}/region_head_tt.safetensors --out out --outline
+```
+
+## Training
+
+{data}
+
+Phase 1: one forward of the frozen H3 per picture at half resolution, at one of the switch steps {switches} of
+{info.get('steps')} (cycled), keeping block {info.get('block')}'s vector per token. 70% of pictures get a random
+off-centre crop and a horizontal flip, so position does not predict the label. Phase 2: logistic regression on the
+stored vectors; the epoch with the best held-out mIoU is kept. Code: `lot/train_tt.py region`
+([how it works](https://github.com/scrya-com/mpeg-diffusion/blob/main/docs/REGION_HEAD.md)).
+
+## Held-out mIoU (64 pictures)
+
+Overall: **{float(info.get('held_miou') or 0):.3f}** (the paper reports 0.59–0.67 against subject masks on Wan).
+
+| Split | mIoU | Pictures |
+|---|---|---|
+{per}
+
+## Limits
+
+- The training data is mostly people (Pexels portraits and isometric scenes), so it is best at finding people.
+- The held-out set has very few non-person subjects, so the "other" score is not reliable.
+- Labels come from detectors (YuNet faces, YOLOE prompted with the caption's words), not from humans.
+"""
+
+
+def upload_region(args) -> None:
+    from huggingface_hub import HfApi
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stage = Path(tmp)
+        info = convert_region(args.region, stage / "region_head_tt.safetensors")
+        saved = torch.load(args.region, map_location="cpu", weights_only=False)
+        info["switches"] = saved.get("switches")
+        (stage / "README.md").write_text(region_card(args.repo, args.folder, info, args.log, args.data))
+        if args.dry_run is not None:
+            shutil.copytree(stage, args.dry_run, dirs_exist_ok=True)
+        else:
+            HfApi().upload_folder(repo_id=args.repo, folder_path=str(stage), path_in_repo=args.folder,
+                                  commit_message=f"{args.folder}: region head (held-out mIoU {float(info['held_miou']):.3f})")
+    print(f"LOT_H3 kind=hf_region_upload repo={args.repo} folder={args.folder} dry_run={args.dry_run is not None} ok=1",
+          flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--lora-dir", type=Path, required=True)
+    parser.add_argument("--lora-dir", type=Path, default=None)
+    parser.add_argument("--region-only", action="store_true",
+                        help="publish --region on its own into --folder (no LoRA), with its own card")
+    parser.add_argument("--log", type=Path, default=None, help="--region-only: the training log, for per-split mIoU")
     parser.add_argument("--repo", default="johndpope/MiniMax-H3-MPEG-Diffusion")
     parser.add_argument("--folder", default="run1")
     parser.add_argument("--steps", type=int, default=2000, help="planned steps (for the card)")
@@ -190,6 +290,13 @@ def main() -> None:
     parser.add_argument("--region", type=Path, default=None, help="region_head_tt.pt from train_tt.py region, published beside the LoRA")
     parser.add_argument("--poll", type=int, default=120)
     args = parser.parse_args()
+    if args.region_only:
+        if args.region is None:
+            raise SystemExit("--region-only needs --region")
+        upload_region(args)
+        return
+    if args.lora_dir is None:
+        raise SystemExit("--lora-dir is required (or --region-only)")
     args.done = []
     while True:
         tags = ready(args)
