@@ -887,7 +887,7 @@ def main() -> None:
     args = parser.parse_args()
     from gpu_guard import auto_swap
 
-    args.swap = auto_swap(args.swap)
+    args.swap = auto_swap(args.swap, inference=args.phase in ("render", "layout"))
     if args.size[0] % 64 or args.size[1] % 64:
         raise SystemExit("--size sides must be multiples of 64 (the LR latent needs whole 2x2 patches)")
     refuse_if_busy("two_track_h3")

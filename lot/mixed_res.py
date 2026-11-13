@@ -179,10 +179,10 @@ class DualKV:
 def _rope(states: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
     """H3's split-half RoPE (``model._apply_rope_split_half``), repeated so this file needs no model import."""
     pairs = table.shape[-3]
-    rotary = torch.stack((states[..., :pairs], states[..., pairs:2 * pairs]), dim=-1)
-    rotary = torch.matmul(table, rotary.unsqueeze(-1)).squeeze(-1)
-    rotary = torch.cat((rotary[..., 0], rotary[..., 1]), dim=-1)
-    return torch.cat((rotary, states[..., 2 * pairs:]), dim=-1)
+    a, b = states[..., :pairs], states[..., pairs:2 * pairs]
+    first = table[..., 0, 0] * a + table[..., 0, 1] * b              # element-wise: no broadcast matmul over heads
+    second = table[..., 1, 0] * a + table[..., 1, 1] * b
+    return torch.cat((first, second, states[..., 2 * pairs:]), dim=-1)
 
 
 def _sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -288,6 +288,16 @@ class TwoTrackPlan:
     def hr_count(self) -> int:
         return int(self.hr_index.numel())
 
+    def grid_source(self, device) -> torch.Tensor:
+        """For each HR-grid cell (raster order), its row in ``cat([LR tokens, HR tokens])``: the LR token that
+        covers it, or its own HR token inside the mask. One gather builds the whole grid."""
+        cached = getattr(self, "_grid_source", None)
+        if cached is None or cached.device != torch.device(device):
+            source = torch.div(self.cell_order, self.scale * self.scale, rounding_mode="floor")
+            source[self.hr_index] = self.lr_count + torch.arange(self.hr_count, device=source.device)
+            self._grid_source = cached = source.to(device)
+        return cached
+
     def to(self, device) -> "TwoTrackPlan":
         self.hr_index = self.hr_index.to(device)
         self.cell_order = self.cell_order.to(device)
@@ -313,20 +323,21 @@ def two_track_attention(attn, hidden: torch.Tensor, rotation: torch.Tensor, *, l
     if capture is not None:
         capture[layer] = (key[:, video_start:split].detach(), value[:, video_start:split].detach())
     query_r = _rope(query, rotation).to(value)
-    key_r = _rope(key, rotation).to(value)
+    key_r = _rope(key[:, :split], rotation[:, :split]).to(value)      # HR rows' own rotated keys are never read
     output = hidden.new_zeros(batch, length, attn.inner_dim, dtype=value.dtype)
-    output[:, :split] = _sdpa(query_r[:, :split], key_r[:, :split], value[:, :split])
+    output[:, :split] = _sdpa(query_r[:, :split], key_r, value[:, :split])
     if plan.hr_count:
-        cells = plan.scale * plan.scale
         lr_key, lr_value = key[:, video_start:split], value[:, video_start:split]
         if maps is None:
-            grid_key = lr_key.repeat_interleave(cells, dim=1)
-            grid_value = lr_value.repeat_interleave(cells, dim=1)
+            # One gather builds the HR grid: each cell takes its LR token's key (copy) or its own HR key.
+            source = plan.grid_source(lr_key.device)
+            grid_key = torch.cat([lr_key, key[:, split:]], dim=1)[:, source]
+            grid_value = torch.cat([lr_value, value[:, split:]], dim=1)[:, source]
         else:
             grid_key = maps.expand(layer, plan.extent, "k", lr_key).to(key.dtype)
             grid_value = maps.expand(layer, plan.extent, "v", lr_value).to(value.dtype)
-        grid_key = grid_key[:, plan.cell_order].index_copy(1, plan.hr_index, key[:, split:])
-        grid_value = grid_value[:, plan.cell_order].index_copy(1, plan.hr_index, value[:, split:])
+            grid_key = grid_key[:, plan.cell_order].index_copy(1, plan.hr_index, key[:, split:])
+            grid_value = grid_value[:, plan.cell_order].index_copy(1, plan.hr_index, value[:, split:])
         grid_key = _rope(grid_key, hr_rotation).to(value)
         output[:, split:] = _sdpa(query_r[:, split:],
                                   torch.cat([key_r[:, :video_start], grid_key], dim=1),

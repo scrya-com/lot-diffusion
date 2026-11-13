@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 
@@ -40,7 +41,7 @@ def card_gb() -> float:
     return free / 2**30
 
 
-def auto_swap(value: str) -> int:
+def auto_swap(value: str, inference: bool = False) -> int:
     """``--swap auto``: DiT blocks to stream from CPU, from the card's free memory.
 
     Measured with ``train_tt.py lora --check`` (two-track LoRA, 1344x768 pairs): 8 blocks peak at
@@ -49,4 +50,10 @@ def auto_swap(value: str) -> int:
     if value != "auto":
         return int(value)
     gb = card_gb()
+    if inference:
+        # Rendering (no LoRA grads, no checkpointing), measured 2026-11-13 on an RTX 5090 at 1344x768, 22 frames,
+        # VAE decode included: peak 26.8 GB with every block resident, about 0.42 GB less per streamed block.
+        # Streaming costs two-track the most (LR steps are short): 14.0 s at 0-2 streamed, 20.9 s at 8.
+        need = 26.8 + 1.0
+        return 0 if gb >= need else min(50, int(math.ceil((need - gb) / 0.42)))
     return 0 if gb >= 64 else 8 if gb >= 28 else 16 if gb >= 21 else 24

@@ -31,6 +31,7 @@ import contextlib
 import sys
 from dataclasses import replace
 
+import os
 import torch
 
 from lot_paths import LOT_H3_CHECKPOINT, MUSUBI_SRC
@@ -98,12 +99,47 @@ def audio_frames(latent_t: int) -> int:
 
 # ------------------------------------------------------------------------------ loading
 
-def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, train: bool = False):
+def rope_split_half(hidden_states: torch.Tensor, rotation_table: torch.Tensor) -> torch.Tensor:
+    """musubi-tuner's ``_apply_rope_split_half`` written element-wise: same arithmetic, without the matmul on
+    a table broadcast over every head (which materialises ``L x heads x pairs x 2 x 2``)."""
+    pairs = rotation_table.shape[-3]
+    a, b = hidden_states[..., :pairs], hidden_states[..., pairs:2 * pairs]
+    t = rotation_table
+    first = t[..., 0, 0] * a + t[..., 0, 1] * b
+    second = t[..., 1, 0] * a + t[..., 1, 1] * b
+    return torch.cat((first, second, hidden_states[..., 2 * pairs:]), dim=-1)
+
+
+def speed_patches() -> None:
+    """Inference speed-ups applied without editing the vendored musubi-tuner.
+
+    - The int8 matmul kernels autotune with ``key=["m", "n", "k"]``; ``m`` is the packed row count, so
+      every new prompt length, resolution or two-track region size re-ran the 6-config benchmark
+      (about 4 s; a first step of 6.2 s against 2.08 s). Keyed on ``n, k`` only, each layer shape tunes once.
+    - The block RoPE uses the element-wise ``rope_split_half``.
+    """
+    from musubi_tuner.minimax_h3 import model as h3_model
+    from musubi_tuner.modules import convrot_int8_kernels as kernels
+
+    for name in ("_int8_matmul_dequant_kernel", "_int8_matmul_dequant_per_row_kernel"):
+        kernel = getattr(kernels, name, None)
+        if kernel is not None and "m" in getattr(kernel, "keys", ()):
+            kernel.keys = [key for key in kernel.keys if key != "m"]
+    h3_model._apply_rope_split_half = rope_split_half
+
+
+def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, train: bool = False,
+             pinned: bool = True):
     """The H3 transformer, frozen, ready for ``predict``.
 
     ``swap`` blocks stream from CPU (H2D only: the base is frozen). ``train``
     turns on activation checkpointing and lets the swap run a backward pass.
+    ``pinned`` keeps the streamed blocks in pinned host memory (about 0.42 GB each), so each block is one
+    async copy; unpinned, a worker thread first copies it into a staging buffer (about 4.6 GB/s), which
+    made a 1,764-token step wait on transfers (0.73 s). ``LOT_H3_PINNED=0`` turns it off.
     """
+    speed_patches()
+    pinned = pinned and os.environ.get("LOT_H3_PINNED", "1") != "0"
     from musubi_tuner.minimax_h3.model import load_h3_transformer
     from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 
@@ -111,7 +147,8 @@ def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, trai
     dit = load_h3_transformer(str(checkpoint), device="cpu" if swap else device)
     dit.requires_grad_(False)
     if swap:
-        dit.enable_block_swap(swap, BlockSwapConfig(device=device, supports_backward=train, h2d_only=True))
+        dit.enable_block_swap(swap, BlockSwapConfig(device=device, supports_backward=train, h2d_only=True,
+                                                    use_pinned_memory=pinned))
         dit.move_to_device_except_swap_blocks(device)
         dit.prepare_block_swap_before_forward()
     if train:

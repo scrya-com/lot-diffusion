@@ -208,6 +208,33 @@ What is left in the 25 s is 16 LR steps (11.7 s), the cropped round trip, and 6 
 gains are switch 18 with 4 HR steps (needs the trained LoRA), the two-track attention overhead, and block
 streaming.
 
+**After the speed fixes (2026-11-13, second review pass).** These are lossless (CPU-checked bit-identical where
+they touch the maths):
+- int8 kernels autotuned once per layer shape instead of per row count, which removes the warm-up on new prompt
+  lengths and region sizes;
+- pinned streaming buffers;
+- element-wise RoPE (speeds up full res too);
+- LR keys rotated only for rows that are read;
+- the HR grid built with one gather;
+- `--swap auto` sized for rendering.
+
+| Streamed blocks | Full res | Two-track (crop + pixel) | Speedup | Peak |
+|---|---|---|---|---|
+| 8 | 27.2 s | 20.9 s | 1.30× | 24.7 GB |
+| 4 | 27.1 s | 15.3 s | 1.77× | 26.1 GB |
+| 2 | 27.2 s | 14.0 s | 1.94× | 26.8 GB |
+| 0 | 27.3 s | 14.0 s | 1.94× | 26.8 GB |
+
+Times are for 22 frames at 1344×768, decode included, on a new prompt (no warm-up). The first run in a process is
+about 4 s slower (one-time autotune).
+
+**Quality needs the fitted maps, not more steps** (`lot/runs/tt_video/training_face.png`, `hr_steps_face.png`):
+- Without maps, the HR region has a diamond-grid grain, and 6, 12 or 20 HR steps all look the same.
+- The ridge-fitted `f_up` maps (`--maps up_maps_tt.pt`, from `fit-kv`, no DiT training) give a clean, sharp face and
+  no visible seam. The time is the same (14.2 s).
+- The 500-step LoRA (`--train`) changes the whole picture, including the LR composition, into a washed-out
+  different image. Do not use it as it stands.
+
 Observations:
 - Clips are coherent across frames. The composition comes from the LR track.
 - Untrained, the HR box is grainy (see `lot/runs/tt_video/f22/grid.png` and the mp4s).
