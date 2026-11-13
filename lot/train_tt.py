@@ -257,7 +257,7 @@ def train_region(args) -> None:
                 two_track_forward(dit, x_lr, None, None, 1.0 - sigma, pair["text"], capture=capture,
                                   res_embed=res_embed)
                 label = label_mask(pair, args.label)
-                out.append((capture["states"].half().cpu(), label.flatten().float(), label,
+                out.append((capture["states"].bfloat16().cpu(), label.flatten().float(), label,   # bf16: activations reach ~2.6e5, past fp16
                             entry.get("subject_class") or "-", switches[number % len(switches)]))
                 if number % 50 == 0:
                     print(f"LOT_H3 kind=tt_region_pair item={number}/{len(entries)} positive={int(label.sum())}",

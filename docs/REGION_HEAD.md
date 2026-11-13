@@ -8,7 +8,7 @@ The region head is what makes the HR region self-selected: at the switch step it
 2. Run one forward of the frozen H3 at half resolution, with no gradients (252 video tokens plus the text and audio rows at 1344×768).
 3. Keep block 25's output for every video token (a 5,376-number vector), with that token's label: 1 on the face or the main subject, else 0.
 
-This is about 0.6 s per image on an RTX 5090 with 8 blocks streamed from CPU. Vectors are stored in fp16 (about 2.7 MB per image).
+This is about 0.6 s per image on an RTX 5090 with 8 blocks streamed from CPU. Vectors are stored in bf16 (about 2.7 MB per image): block-25 activations reach about 2.6e5, past fp16's range.
 
 **Phase 2: fit the head (seconds per epoch).** Logistic regression on the stored vectors: BCE between `s` and the labels, with positives up-weighted by their rarity. No gradient touches H3. Every epoch reports held-out mIoU of the thresholded region (smoothed, `m + α(p − m)`, the paper's rule), split by person/other subject and by switch step. The paper reports 0.59–0.67 against subject masks.
 
