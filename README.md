@@ -40,6 +40,42 @@ These are independent ports. They are not the authors' releases.
 | More than two levels for many-megapixel images | 📝 Draft, CPU-tested ([LARGE_IMAGES.md](docs/LARGE_IMAGES.md), [#3](https://github.com/scrya-com/mpeg-diffusion/issues/3)) |
 | Level-of-Token adapters | ⚠️ 2.15–2.85× faster DiT forward, but soft coarse regions ([LEVEL_OF_TOKEN.md](docs/LEVEL_OF_TOKEN.md)) |
 
+## Performance (early measurements)
+
+> [!NOTE]
+> **Early measurements, not a benchmark.**
+> - **Coverage:** one RTX 5090 and one int8 H3 checkpoint, 1–2 prompts per row, quality judged by eye.
+> - **Region size:** two-track time depends on how much of the frame the region head picks (12–29% so far).
+> - **Not yet tested:** other GPUs, resolutions, step counts, prompts and LoRAs.
+
+All rows: 1344×768, wall time **including the VAE decode**, fitted K/V maps plus region head v3
+([`--preset quality`](docs/TWO_TRACK_FLOW.md)).
+
+**ComfyUI, 73 frames (3 s)**, int8 convrot VAE, warm runs:
+
+| | Time | vs base full res |
+|---|---|---|
+| Base, full resolution, 20 steps | 132.4 s | 1× |
+| Base + two-track, 20 steps | 68.3 s | 1.94× |
+| Turbo LoRA, full resolution, 8 steps | 66.6 s | 1.99× |
+| **Turbo LoRA + two-track, 8 steps** | **45.2 s** | **2.93×** |
+
+**Longer clips, base model, 20 steps** (`two_track_h3.py render`). The gain grows with length:
+
+| Frames | Full res | Two-track | Speedup |
+|---|---|---|---|
+| 22 (~1 s) | 27.1 s | 14.4 s | 1.9× |
+| 73 (3 s) | 138 s | 56 s | 2.5× |
+| 145 (6 s) | 398 s | 128 s | 3.1× |
+
+A 15 s clip (362 frames) renders in ComfyUI with Turbo + two-track (250 s, cold start).
+
+**Quality notes:**
+- Subjects in the region are sharp, with no seams or flicker.
+- Outside the region the frame is the half-resolution track, upscaled.
+- Full res and two-track compose different pictures from the same seed.
+- The base model needs no fine-tune; the Turbo LoRA works with the same maps.
+
 ## Quick start
 
 ```bash

@@ -207,14 +207,23 @@ class VaeUpscaler:
 
     @torch.no_grad()
     def _resample(self, latent: torch.Tensor, **interp) -> torch.Tensor:
-        pixels = self.vae.decode(latent.to("cuda", self.dtype)).float().clamp(-1, 1)      # (1, 3, F, H, W)
+        # Long clips (16 s): the decoded clip leaves the GPU at once as fp16, the resize runs 16 frames at a time,
+        # and only the fp16 result goes back for the encode, so the GPU never holds a float32 copy of the clip.
+        pixels = self.vae.decode(latent.to("cuda", self.dtype)).clamp(-1, 1).to("cpu", torch.float16)
         if latent.shape[2] == 1:
             pixels = pixels[:, :, :1]
         b, c, f, h, w = pixels.shape
-        frames = pixels.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w)
-        frames = F.interpolate(frames, **interp).clamp(-1, 1)
-        pixels = frames.reshape(b, f, c, *frames.shape[-2:]).permute(0, 2, 1, 3, 4)
-        out = self.vae.encode((pixels[:, :, 0] if f == 1 else pixels).to(self.dtype)).float()
+        resized = None
+        for start in range(0, f, 16):
+            chunk = pixels[0, :, start:start + 16].transpose(0, 1).to("cuda", torch.float32)       # (n, 3, h, w)
+            chunk = F.interpolate(chunk, **interp).clamp(-1, 1).to("cpu", torch.float16)
+            if resized is None:
+                resized = torch.empty(1, c, f, *chunk.shape[-2:], dtype=torch.float16)
+            resized[0, :, start:start + chunk.shape[0]] = chunk.transpose(0, 1)
+        del pixels
+        torch.cuda.empty_cache()
+        pixels = resized.to("cuda", self.dtype)
+        out = self.vae.encode(pixels[:, :, 0] if f == 1 else pixels).float()
         if out.shape[2] != latent.shape[2]:
             raise RuntimeError(f"VAE round trip changed latent frames {latent.shape[2]} -> {out.shape[2]}")
         return out
@@ -386,20 +395,28 @@ def pixel_compose(vae, hr_latent: torch.Tensor, lr_latent: torch.Tensor, weight:
     ``(1, 1, T, H, W)``) mapped to pixels: x16 in space, each latent frame to the pixel frames it decodes to."""
     from h3_musubi import pixel_frames
 
+    # Long clips: each decode leaves the GPU as fp16 at once, and the paste runs ``chunk`` frames at a time,
+    # so the GPU never holds more than one full clip (16 s at 1344x768 is 2.4 GB in fp16, 4.8 GB in fp32).
     dtype = next(vae.parameters()).dtype
-    hr_px = vae.decode(hr_latent.to("cuda", dtype)).float().clamp(-1, 1)
-    lr_px = vae.decode(lr_latent.to("cuda", dtype)).float().clamp(-1, 1)
+    hr_px = vae.decode(hr_latent.to("cuda", dtype)).clamp(-1, 1).to("cpu", torch.float16)
+    lr_px = vae.decode(lr_latent.to("cuda", dtype)).clamp(-1, 1).to("cpu", torch.float16)
     if hr_latent.shape[2] == 1:
         hr_px, lr_px = hr_px[:, :, :1], lr_px[:, :, :1]
-    b, c, f, h, w = lr_px.shape
-    lr_up = F.interpolate(lr_px.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w), scale_factor=2, mode="bicubic",
-                          align_corners=False).clamp(-1, 1)
-    lr_up = lr_up.reshape(b, f, c, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
+    frames = hr_px.shape[2]
     frame_of = [k for k in range(hr_latent.shape[2]) for _ in range(pixel_frames(k + 1) - pixel_frames(k))]
-    frame_of = torch.tensor((frame_of + [frame_of[-1]] * f)[:hr_px.shape[2]], device=weight.device)
-    w_px = F.interpolate(weight[0, 0][:, None].float(), scale_factor=16, mode="bilinear", align_corners=False)
-    w_px = w_px[frame_of][:, 0][None, None]                                  # (1, 1, F, H, W)
-    return w_px * hr_px + (1.0 - w_px) * lr_up
+    frame_of = (frame_of + [frame_of[-1]] * frames)[:frames]
+    weight = weight[0, 0].float().to("cuda")                                    # (T, H, W) on the HR latent grid
+    out = torch.empty_like(hr_px)
+    chunk = 16
+    for start in range(0, frames, chunk):
+        stop = min(frames, start + chunk)
+        lr = lr_px[0, :, start:stop].to("cuda", torch.float32).transpose(0, 1)            # (n, 3, h, w)
+        lr_up = F.interpolate(lr, scale_factor=2, mode="bicubic", align_corners=False).clamp(-1, 1)
+        w_px = F.interpolate(weight[frame_of[start:stop]][:, None], scale_factor=16, mode="bilinear",
+                             align_corners=False)                                           # (n, 1, H, W)
+        hr = hr_px[0, :, start:stop].to("cuda", torch.float32).transpose(0, 1)
+        out[0, :, start:stop] = (w_px * hr + (1.0 - w_px) * lr_up).transpose(0, 1).to("cpu", torch.float16)
+    return out
 
 
 # -------------------------------------------------------------------------- phases
@@ -495,6 +512,8 @@ def held_prompts(args):
     from render_h3 import load_prompts
     from train_h3 import CACHE, list_items
 
+    if getattr(args, "te", None):
+        return load_prompts(args.prompts, list(args.te))
     held = [te for _latent, te in list_items(args.cache or CACHE, args.holdout)[1]]
     return load_prompts(args.prompts, held)
 
@@ -558,16 +577,15 @@ def render(args) -> None:
                 mask = info["mask"]
                 count = sum(info["tokens"]) / len(info["tokens"])
                 meta["hr_share"].append(round(float(mask.float().mean()), 4))
-            torch.cuda.synchronize()
-            meta["timings"][name].append(round(time.perf_counter() - start, 2))
             meta["tokens"][name].append(round(count, 1))
+            # Every variant is timed through its decode to pixels (sampling + VAE), the number a user waits for.
             if name == "two_track" and args.final == "pixel" and "lr" in info:
                 pixels = pixel_compose(upscale.vae, latent, info["lr"], info["weight"])
-                torch.cuda.synchronize()
-                meta["timings"][name][-1] = round(time.perf_counter() - start, 2)   # the composite decodes: count it
-                meta.setdefault("note", "two_track timing with --final pixel includes its decode; others exclude decode")
             else:
-                pixels = upscale.vae.decode(latent.to("cuda", upscale.dtype))
+                pixels = upscale.vae.decode(latent.to("cuda", upscale.dtype)).to("cpu", torch.float16)
+            torch.cuda.synchronize()
+            meta["timings"][name].append(round(time.perf_counter() - start, 2))
+            meta["note"] = "timings include the VAE decode for every variant"
             if latent_t > 1:
                 save_clip(pixels, args.out / f"p{index}_{name}.mp4")
                 pixels = pixels[:, :, pixels.shape[2] // 2:pixels.shape[2] // 2 + 1]       # the grid shows the middle frame
@@ -856,6 +874,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=None, help="still cache with text (prompts and fit data)")
     parser.add_argument("--holdout", type=int, default=24)
+    parser.add_argument("--te", type=Path, nargs="+", default=None,
+                        help="render: caption embeddings (*_minimaxh3_te.safetensors) to use as prompts instead of a "
+                             "cache's held-out items, e.g. from the HF dataset johndpope/MiniMax-H3-pexels-people-text")
     parser.add_argument("--items", type=int, default=24)
     parser.add_argument("--prompts", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
