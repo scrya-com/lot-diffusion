@@ -240,20 +240,25 @@ def train_region(args) -> None:
     res_embed = None
     if args.train is not None:
         _network, _maps, res_embed = load_trained(dit, args.train)
-    sigma = float(sigma_schedule(args.steps_schedule)[args.switch - 1])
+    # One head for several switch steps: each pair is seen at one of them (cycled), so the same layer
+    # reads the layout early (step 6 of 20) or late (step 14).
+    switches = args.switches or [args.switch]
+    schedule = sigma_schedule(args.steps_schedule)
 
     def collect(entries, offset):
         out = []
         with torch.no_grad():
             for number, entry in enumerate(entries):
                 pair = load_pair(entry)
+                sigma = float(schedule[switches[number % len(switches)] - 1])
                 gen = torch.Generator("cuda").manual_seed(offset + number)
                 x_lr = (1.0 - sigma) * pair["lr"] + sigma * torch.randn(pair["lr"].shape, device="cuda", generator=gen)
                 capture = {"block": args.block}
                 two_track_forward(dit, x_lr, None, None, 1.0 - sigma, pair["text"], capture=capture,
                                   res_embed=res_embed)
                 label = label_mask(pair, args.label)
-                out.append((capture["states"].cpu(), label.flatten().float(), label))
+                out.append((capture["states"].half().cpu(), label.flatten().float(), label,
+                            entry.get("subject_class") or "-", switches[number % len(switches)]))
                 if number % 50 == 0:
                     print(f"LOT_H3 kind=tt_region_pair item={number}/{len(entries)} positive={int(label.sum())}",
                           flush=True)
@@ -263,34 +268,39 @@ def train_region(args) -> None:
     held_pairs = collect(held, 10_000)
     del dit
     torch.cuda.empty_cache()
-    positive = sum(float(t.sum()) for _s, t, _m in pairs)
-    count = sum(t.numel() for _s, t, _m in pairs)
+    positive = sum(float(p[1].sum()) for p in pairs)
+    count = sum(p[1].numel() for p in pairs)
     pos_weight = torch.tensor(min(20.0, (count - positive) / max(positive, 1.0)), device="cuda")
     head = RegionHead(pairs[0][0].shape[-1]).cuda()
     optimizer = torch.optim.Adam(head.parameters(), lr=args.lr)
     for epoch in range(args.epochs):
         random.Random(epoch).shuffle(pairs)
         total = 0.0
-        for states, target, _mask in pairs:
-            loss = F.binary_cross_entropy_with_logits(head(states.cuda()), target.cuda(), pos_weight=pos_weight)
+        for states, target, _mask, _cls, _sw in pairs:
+            loss = F.binary_cross_entropy_with_logits(head(states.cuda().float()), target.cuda(), pos_weight=pos_weight)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             total += float(loss.detach())
-        ious = []
+        ious, groups = [], {}
         with torch.no_grad():
-            for states, _target, mask in held_pairs:
+            for states, _target, mask, cls, sw in held_pairs:
                 if not mask.any():
                     continue
-                scores = head(states.cuda()).float().cpu().reshape(mask.shape)
+                scores = head(states.cuda().float()).float().cpu().reshape(mask.shape)
                 picked = region_mask(scores, alpha=args.alpha)
-                ious.append(float((picked & mask).sum()) / max(1.0, float((picked | mask).sum())))
+                iou = float((picked & mask).sum()) / max(1.0, float((picked | mask).sum()))
+                ious.append(iou)
+                for key in (f"class:{'person' if cls == 'person' else 'other'}", f"switch:{sw}"):
+                    groups.setdefault(key, []).append(iou)
         miou = sum(ious) / max(1, len(ious))
-        print(f"LOT_H3 kind=tt_region_epoch epoch={epoch} bce={total / len(pairs):.4f} held_miou={miou:.3f}",
+        detail = " ".join(f"{k}={sum(v) / len(v):.3f}(n={len(v)})" for k, v in sorted(groups.items()))
+        print(f"LOT_H3 kind=tt_region_epoch epoch={epoch} bce={total / len(pairs):.4f} held_miou={miou:.3f} {detail}",
               flush=True)
     args.out.mkdir(parents=True, exist_ok=True)
     torch.save({"state": head.state_dict(), "hidden": pairs[0][0].shape[-1], "block": args.block,
-                "switch": args.switch, "steps": args.steps_schedule, "label": args.label,
+                "switch": switches[len(switches) // 2], "switches": switches, "steps": args.steps_schedule,
+                "label": args.label,
                 "train": str(args.train), "held_miou": miou}, args.out / "region_head_tt.pt")
     print(f"LOT_H3 kind=tt_region_done out={args.out / 'region_head_tt.pt'} held_miou={miou:.3f} ok=1", flush=True)
 
@@ -451,6 +461,8 @@ def main() -> None:
     parser.add_argument("--block", type=int, default=MID_BLOCK)
     parser.add_argument("--steps-schedule", type=int, default=20, help="region: sampler steps the switch refers to")
     parser.add_argument("--switch", type=int, default=12, help="region: the sampler's switch step")
+    parser.add_argument("--switches", type=int, nargs="+", default=None,
+                        help="region: train one head for several switch steps (cycled over the pairs)")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--alpha", type=float, default=0.5)
     # decoder
