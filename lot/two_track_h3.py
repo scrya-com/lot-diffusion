@@ -412,7 +412,18 @@ def load_base(swap: int):
 
 
 def load_maps(path: Path) -> UpMaps:
-    saved = torch.load(path, map_location="cpu", weights_only=False)
+    """``up_maps_tt.pt`` from ``fit-kv``, or the published ``up_maps_tt.safetensors`` (same keys, layers /
+    rank in the metadata)."""
+    path = Path(path)
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        with safe_open(str(path), "pt") as handle:
+            meta = handle.metadata() or {}
+        saved = {"state": load_file(str(path)), "layers": int(meta["layers"]), "rank": int(meta["rank"])}
+    else:
+        saved = torch.load(path, map_location="cpu", weights_only=False)
     maps = UpMaps(saved["layers"], HEAD_DIM, [EXTENT], rank=saved["rank"])
     maps.load_state_dict(saved["state"])
     return maps.to("cuda").eval()
