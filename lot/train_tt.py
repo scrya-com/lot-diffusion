@@ -236,9 +236,10 @@ def train_region(args) -> None:
     from two_track_h3 import load_base, load_trained
 
     train, held = list_pairs(args.pairs, args.holdout)
-    dit = load_base(args.swap)
+    cached = args.features is not None and args.features.is_file()
+    dit = None if cached else load_base(args.swap)
     res_embed = None
-    if args.train is not None:
+    if args.train is not None and not cached:
         _network, _maps, res_embed = load_trained(dit, args.train)
     # One head for several switch steps: each pair is seen at one of them (cycled), so the same layer
     # reads the layout early (step 6 of 20) or late (step 14).
@@ -264,15 +265,28 @@ def train_region(args) -> None:
                           flush=True)
         return out
 
-    pairs = collect(train[:args.items], 0)
-    held_pairs = collect(held, 10_000)
-    del dit
-    torch.cuda.empty_cache()
+    if cached:
+        # Phase 1 already ran: reuse its features (refits take seconds, not a 30-minute collection).
+        saved_features = torch.load(args.features, map_location="cpu", weights_only=False)
+        pairs, held_pairs, switches = saved_features["train"], saved_features["held"], saved_features["switches"]
+        print(f"LOT_H3 kind=tt_region_features_loaded path={args.features} train={len(pairs)} held={len(held_pairs)}",
+              flush=True)
+    else:
+        pairs = collect(train[:args.items], 0)
+        held_pairs = collect(held, 10_000)
+        del dit
+        torch.cuda.empty_cache()
+        if args.features is not None:
+            args.features.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"train": pairs, "held": held_pairs, "switches": switches, "block": args.block,
+                        "label": args.label, "train_dir": str(args.train)}, args.features)
+            print(f"LOT_H3 kind=tt_region_features_saved path={args.features}", flush=True)
     positive = sum(float(p[1].sum()) for p in pairs)
     count = sum(p[1].numel() for p in pairs)
     pos_weight = torch.tensor(min(20.0, (count - positive) / max(positive, 1.0)), device="cuda")
     head = RegionHead(pairs[0][0].shape[-1]).cuda()
-    optimizer = torch.optim.Adam(head.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    best = (-1.0, None, -1)                                    # held-out mIoU, state, epoch
     for epoch in range(args.epochs):
         random.Random(epoch).shuffle(pairs)
         total = 0.0
@@ -297,8 +311,14 @@ def train_region(args) -> None:
         detail = " ".join(f"{k}={sum(v) / len(v):.3f}(n={len(v)})" for k, v in sorted(groups.items()))
         print(f"LOT_H3 kind=tt_region_epoch epoch={epoch} bce={total / len(pairs):.4f} held_miou={miou:.3f} {detail}",
               flush=True)
+        if miou > best[0]:
+            best = (miou, {k: v.detach().clone() for k, v in head.state_dict().items()}, epoch)
+    # Keep the epoch with the best held-out mIoU (the training loss keeps falling after mIoU stops rising).
+    miou = best[0]
+    head.load_state_dict(best[1])
+    print(f"LOT_H3 kind=tt_region_best epoch={best[2]} held_miou={miou:.3f}", flush=True)
     args.out.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": head.state_dict(), "hidden": pairs[0][0].shape[-1], "block": args.block,
+    torch.save({"state": head.state_dict(), "best_epoch": best[2], "hidden": pairs[0][0].shape[-1], "block": args.block,
                 "switch": switches[len(switches) // 2], "switches": switches, "steps": args.steps_schedule,
                 "label": args.label,
                 "train": str(args.train), "held_miou": miou}, args.out / "region_head_tt.pt")
@@ -461,6 +481,9 @@ def main() -> None:
     parser.add_argument("--block", type=int, default=MID_BLOCK)
     parser.add_argument("--steps-schedule", type=int, default=20, help="region: sampler steps the switch refers to")
     parser.add_argument("--switch", type=int, default=12, help="region: the sampler's switch step")
+    parser.add_argument("--features", type=Path, default=None,
+                        help="region: phase-1 features file; written after collection, reused when it exists")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="region: Adam weight decay on the head")
     parser.add_argument("--switches", type=int, nargs="+", default=None,
                         help="region: train one head for several switch steps (cycled over the pairs)")
     parser.add_argument("--epochs", type=int, default=20)
