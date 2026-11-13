@@ -89,7 +89,13 @@ SYNONYMS = {
     "person": ("person", "people", "woman", "women", "man", "men", "girl", "girls", "boy", "boys", "child",
                "children", "kid", "kids", "lady", "guy", "bride", "groom", "couple", "model", "dancer", "chef",
                "worker", "student", "player", "family", "baby", "teenager", "athlete", "musician", "figure",
-               "character", "portrait", "supermodel", "farmer", "doctor", "soldier", "knight", "wizard"),
+               "character", "portrait", "supermodel", "farmer", "doctor", "soldier", "knight", "wizard", "teacher",
+               "violinist", "singer", "artist", "painter", "scientist", "mother", "father", "grandmother",
+               "grandfather", "warrior", "viking", "priest", "nurse", "pilot", "astronaut", "explorer", "hiker",
+               "traveler", "tourist", "businessman", "businesswoman", "influencer", "actor", "actress", "mechanic",
+               "miner", "blacksmith", "baker", "barista", "gardener", "fisherman", "sailor", "queen", "king",
+               "princess", "prince", "monk", "witch", "elf", "dwarf", "hero", "villain", "superhero", "girlfriend",
+               "boyfriend", "wife", "husband", "friends", "crowd", "audience", "guest", "guests", "host"),
     "dining table": ("table", "desk"), "potted plant": ("plant", "plants", "flowers", "bonsai"),
     "tv": ("tv", "television", "screen", "monitor"), "couch": ("couch", "sofa"), "motorcycle": ("motorbike",),
     "airplane": ("plane", "aircraft"), "cell phone": ("phone", "smartphone"),
@@ -138,6 +144,81 @@ class SubjectSegmenter:
 
         best = max(pool, key=score)
         keep = [i for i in pool if classes[i] == classes[best] and score(i) >= 0.5 * score(best)]
+        return np.any(masks[keep], axis=0), classes[best]
+
+
+STOPWORDS = set("""a an the and or of in on at to for with without from by into onto over under near behind beside
+between among around through across along up down out off is are was were be been being this that these those it its
+their his her them they he she we you your our my as while than then there here very more most some any each every all
+both few many much other another such own same so too just only also not no nor can will would should could may might
+featuring featured features showing shows shown displaying depicting set sits sitting standing stands lying posing
+poses looking holding wearing walking dressed made using surrounded filled covered decorated placed seen view views
+scene scenes style styled image photo photograph picture shot render rendering illustration artwork design concept
+isometric photorealistic realistic detailed highly ultra high quality 3d 2d cozy luxurious luxury modern vintage
+classic rustic elegant stylish beautiful stunning gorgeous captivating charming vibrant vivid colorful soft warm cool
+cold bright dark dim moody dramatic cinematic natural ambient golden pastel lighting light lights lit glow glowing
+background foreground backdrop setting atmosphere mood tone tones color colors colour black white small large big tiny
+huge little tall short long wide young old new front side top bottom left right center middle inside outside interior
+exterior close closeup close-up full half wall floor ceiling day night time morning evening sunset sunrise room
+rooms living area space diorama miniature technical illustration render cutaway cross-section section interior-design
+landscape cityscape environment world place location surroundings ambience vibe aesthetic theme themed""".split())
+
+
+class YoloeSubject:
+    """Main subject with YOLOE (open-vocabulary segmentation), prompted with the caption's content words.
+
+    Closer to the paper's LLM + Grounded SAM than a fixed 80-class detector: "a lighthouse on a cliff" can
+    segment the lighthouse. Words earlier in the caption rank higher (the subject usually comes first).
+    Falls back to ``fallback`` (the COCO ranking) when no prompt finds anything."""
+
+    def __init__(self, model: str = "yoloe-11s-seg.pt", conf: float = 0.25, max_words: int = 8, fallback=None):
+        from ultralytics import YOLOE
+
+        self.model, self.conf, self.max_words, self.fallback = YOLOE(model), conf, max_words, fallback
+        self._names: list[str] | None = None
+
+    def candidates(self, caption: str) -> list[str]:
+        import re
+
+        words, out = re.findall(r"[a-z][a-z-]+", caption.lower()), []
+        for word in words:
+            if len(word) < 3 or word in STOPWORDS:
+                continue
+            word = "person" if word in SYNONYMS["person"] else word
+            if word not in out:
+                out.append(word)
+        return out[:self.max_words] or ["person"]
+
+    def mask(self, rgb: np.ndarray, caption: str = "") -> tuple[np.ndarray, str]:
+        height, width = rgb.shape[:2]
+        names = self.candidates(caption)
+        if names != self._names:
+            self.model.set_classes(names, self.model.get_text_pe(names))
+            self._names = names
+        result = self.model.predict(rgb[:, :, ::-1], conf=self.conf, verbose=False, retina_masks=True)[0]
+        if result.masks is None or len(result.boxes) == 0:
+            if self.fallback is not None:
+                return self.fallback.mask(rgb, caption)
+            return np.zeros((height, width), dtype=bool), ""
+        masks = result.masks.data.cpu().numpy().astype(bool)
+        classes = [names[int(c)] for c in result.boxes.cls.tolist()]
+        confs = result.boxes.conf.tolist()
+        yy, xx = np.mgrid[0:height, 0:width]
+
+        def score(i: int) -> float:
+            area = masks[i].mean()
+            if area == 0 or area > 0.35:                      # scene-sized masks ("hospital", "underwater") are not subjects
+                return 0.0
+            cy, cx = yy[masks[i]].mean() / height - 0.5, xx[masks[i]].mean() / width - 0.5
+            order = 1.0 - 0.08 * names.index(classes[i])        # earlier caption words first
+            people = 1.5 if classes[i] == "person" else 1.0       # where viewers look first
+            return confs[i] * area ** 0.5 * (1.0 - 0.8 * (cy * cy + cx * cx) ** 0.5) * order * people
+
+        best = max(range(len(classes)), key=score)
+        if score(best) <= 0.0:
+            return (self.fallback.mask(rgb, caption) if self.fallback is not None
+                    else (np.zeros((height, width), dtype=bool), ""))
+        keep = [i for i in range(len(classes)) if classes[i] == classes[best] and score(i) >= 0.5 * score(best)]
         return np.any(masks[keep], axis=0), classes[best]
 
 
@@ -211,8 +292,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--items", type=int, default=0, help="0 = all")
     parser.add_argument("--detector", choices=("yunet", "haar"), default="yunet")
-    parser.add_argument("--subject", choices=("none", "yolo", "main"), default="none",
-                        help="yolo: people only; main: the main subject, any of YOLO's 80 classes, caption-guided")
+    parser.add_argument("--subject", choices=("none", "yolo", "main", "yoloe"), default="none",
+                        help="yolo: people only; main: the main subject, any of YOLO's 80 classes, caption-guided; "
+                             "yoloe: open-vocabulary YOLOE prompted with the caption's words (falls back to main)")
+    parser.add_argument("--yoloe-model", default="yoloe-11s-seg.pt")
     parser.add_argument("--relabel", action="store_true",
                         help="recompute face/subject masks of existing pairs in --out (no re-encoding)")
     parser.add_argument("--yolo-model", default="yolo11n-seg.pt")
@@ -238,7 +321,7 @@ def main() -> None:
     vae = load_upscaler()
     faces = FaceDetector(args.detector)
     people = PersonSegmenter(args.yolo_model) if args.subject == "yolo" else None
-    subjects = SubjectSegmenter(args.yolo_model) if args.subject == "main" else None
+    subjects = make_subjects(args)
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -283,6 +366,15 @@ def main() -> None:
     print(f"LOT_H3 kind=pairs_done out={args.out} pairs={len(index)} with_face={with_face} ok=1", flush=True)
 
 
+def make_subjects(args):
+    """The main-subject segmenter for ``--subject`` (``None`` for none / yolo)."""
+    if args.subject == "main":
+        return SubjectSegmenter(args.yolo_model)
+    if args.subject == "yoloe":
+        return YoloeSubject(args.yoloe_model, fallback=SubjectSegmenter(args.yolo_model))
+    return None
+
+
 def relabel(args) -> None:
     """Recompute the masks of existing pairs: decode ``hr``, detect faces and the main subject, rewrite."""
     from safetensors import safe_open
@@ -294,10 +386,11 @@ def relabel(args) -> None:
     entries = json.loads(index_path.read_text())
     vae = load_upscaler()
     faces = FaceDetector(args.detector)
-    subjects = SubjectSegmenter(args.yolo_model)
+    subjects = make_subjects(args) or SubjectSegmenter(args.yolo_model)
+    tag = "yoloe" if args.subject == "yoloe" else "main"
     classes: dict[str, int] = {}
     for number, entry in enumerate(entries):
-        if entry.get("relabel") == "main" and not args.items:
+        if entry.get("relabel") == tag and not args.items:
             continue                                               # resumable
         path = args.out / entry["pair"]
         with safe_open(str(path), "pt") as handle:
@@ -311,7 +404,7 @@ def relabel(args) -> None:
         tensors["face"], tensors["subject"] = face.to(torch.uint8), subject.to(torch.uint8)
         save_file({k: v.contiguous() for k, v in tensors.items()}, str(path))
         entry.update({"face_tokens": int(face.sum()), "subject_tokens": int(subject.sum()), "subject_class": name,
-                      "relabel": "main"})
+                      "relabel": tag})
         classes[name or "-"] = classes.get(name or "-", 0) + 1
         if number % 50 == 0:
             index_path.write_text(json.dumps(entries, indent=0))
