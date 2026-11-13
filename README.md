@@ -72,11 +72,36 @@ Faces are the clearest failure. The face in the grid is drawn by the LR track at
    - Loss: their eq. 2, velocity MSE of LR tokens outside `M` plus HR tokens inside `M`, each normalised by its region's size, through `two_track_forward`.
    - Train (`train_tt.py lora`): a LoRA (rank 16 on qkv/out/fc1/fc2) instead of the full fine-tune, together with the `UpMaps` and two zero-initialised resolution-embedding vectors (one for HR tokens, one for LR) added to the video rows.
    - Data: people photos with captions. `fetch_pexels.py` downloads them from the Hugging Face list `gaunernst/pexels-portrait` (URLs plus captions, Pexels license). Those are mostly large faces, so mix in scenes with small faces, the failing case.
-3. **Better map initialisation before the fine-tune.** The value fit (0.90 residual) is the weak half. `fit-kv --pairs` now fits from the pairs (no VAE round trip per item) over sigmas 0.2–0.95, which covers the sigmas the HR track sees after an earlier switch; use `--items 200` or more. On 4 items the residual was 0.49 on keys and 0.85 on values. The paper's linear relation is also measured on the base model without fine-tuning, so the residual is a fair check: whatever the linear map cannot carry, the LoRA has to.
-4. **Region head on subject labels.** `train_tt.py region` trains the head with the face and person masks as BCE targets instead of the latent-L1 label, on the fine-tuned model's states at the switch, and reports held-out mIoU. The paper reports 0.59–0.67 against such masks with a single linear layer; the 16-item smoke run gave 0.57.
+3. **Better map initialisation before the fine-tune.** The value fit (0.90 residual) is the weak half. `fit-kv --pairs` now fits from the pairs (no VAE round trip per item) over sigmas 0.2–0.95, which covers the sigmas the HR track sees after an earlier switch; use `--items 200` or more. On 4 items the residual was 0.49 on keys and 0.85 on values; on 200 items (Pexels people and iso3d scenes, 5 sigmas) it was 0.52 and 0.89, unchanged, so the limit is the linear map, not the data. The paper's linear relation is also measured on the base model without fine-tuning, so the residual is a fair check: whatever the linear map cannot carry, the LoRA has to.
+4. **Region head on subject labels.** `train_tt.py region` trains the head with face and main-subject masks as BCE targets instead of the latent-L1 label, and reports held-out mIoU. Like the paper, it trains on the frozen DiT (`--train` optionally reads a fine-tuned model's states instead). How it works is below. The paper reports 0.59–0.67 against such masks with a single linear layer; the 16-item smoke run gave 0.57.
 5. **Learned upscaler and mixer** (their Sec. H): `train_tt.py decoder` trains `U` and `G` on real pairs, with the HR latent inside the mask and the LR latent outside. It uses their eq. 11 loss (latent L1 outside `M` up-weighted at the edge, pixel L1 and LPIPS on a decoded crop at the edge). Gradients pass through the frozen VAE decoder; a 256 px crop peaks at 12 GB. `two_track_h3.py render --decoder` uses `U` at the switch and at the end, and `G` instead of the feathered paste.
 
 Order of value for faces: (1) is free and helps at once; (2) is what lets the HR track fix the face; (3) and (4) make (2) converge faster; (5) is about seams and the background.
+
+#### The region head: how it trains
+
+The region head is what makes the HR region self-selected: at the switch step it reads the DiT's own features and decides, per token, what is the subject. The paper's observation (Sec. 3.3) is that mid-way through denoising, the DiT already encodes where the subject is, so one linear layer can read it out: `s = wᵀ LN(h)` on a middle block, about 5,400 parameters. Training is a linear probe on the frozen model, in two phases (`train_tt.py region`):
+
+**Phase 1: collect features (one forward per image).** For each pair:
+
+1. Noise the half-resolution latent to the sigma of a switch step. With `--switches 6 8 10 12 14`, each pair is seen at one of them in turn, so one head works for an early or a late switch.
+2. Run one forward of the frozen H3 at half resolution, with no gradients (252 video tokens plus the text and audio rows at 1344×768).
+3. Keep block 25's output for every video token (a 5,376-number vector), with that token's label: 1 on the face or the main subject, else 0.
+
+This is about 0.6 s per image on an RTX 5090 with 8 blocks streamed from CPU. Vectors are stored in fp16 (about 2.7 MB per image).
+
+**Phase 2: fit the head (seconds per epoch).** Logistic regression on the stored vectors: BCE between `s` and the labels, with positives up-weighted by their rarity. No gradient touches H3. Every epoch reports held-out mIoU of the thresholded region (smoothed, `m + α(p − m)`, the paper's rule), split by person/other subject and by switch step. The paper reports 0.59–0.67 against subject masks.
+
+| | LoRA (`train_tt.py lora`) | Region head (`train_tt.py region`) |
+|---|---|---|
+| Trainable parameters | 82.7 M | about 5.4 k |
+| Passes through H3 | forward + backward through 50 blocks, every step | one forward per image, once |
+| Sequence | LR + HR tokens | LR tokens only |
+| Time on a 5090 | 3–4 s per step | about 0.6 s per image, then seconds |
+
+**Labels for any subject.** `build_pairs_tt.py --subject main` (or `--relabel` on existing pairs) stands in for the paper's LLM + Grounded SAM. It takes YOLO instance masks of any of its 80 classes, prefers the classes the caption names ("a dog on a sofa" picks the dog), and ranks by confidence, size and centrality. Faces come from YuNet. On the 403 landscape iso3d scenes it picked person 274 times, then couch 49, chair 14, potted plant 12, car 9, motorcycle 5, dog 4 and others; 11 had no subject.
+
+**See what it picks.** `two_track_h3.py layout --region head.pt --cache-list CACHE... --switch 10` samples each held-out caption with the base model at half resolution, scores the tokens at the switch, and draws each row as two panels. The left panel is the image with the score heatmap and the selected region outlined. The right panel is the LoT layout that region implies on the full-resolution token grid (1×1 inside, 2×2 on a one-token ring, 4×4 elsewhere), with its token count. The images are generated from the captions, not the training photos.
 
 ## Quick start
 
