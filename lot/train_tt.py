@@ -95,11 +95,15 @@ def label_mask(pair: dict, kind: str) -> torch.Tensor:
 # ---------------------------------------------------------------------------- lora
 
 
-def eq2_loss(v_lr, v_hr, pair, eps_lr, eps_hr, mask, hr_weight: float):
-    """Their eq. 2 in H3's ``x0 - eps`` convention: LR outside ``M`` plus HR inside ``M``."""
+def eq2_loss(v_lr, v_hr, pair, eps_lr, eps_hr, mask, hr_weight: float, lr_everywhere: bool = True):
+    """Their eq. 2 in H3's ``x0 - eps`` convention: LR outside ``M`` plus HR inside ``M``.
+
+    The port keeps a complete LR track (the paper drops LR tokens inside ``M`` and adds ``f_down``). Those
+    LR rows are keys for every LR query and are what the paste's feather band shows, so by default they are
+    supervised too (``lr_everywhere``); False is the paper's loss on the paper's token set."""
     inside_lr = mask_to_latent(mask, 2).to(v_lr.device)
     inside_hr = mask_to_latent(mask, 4).to(v_lr.device)
-    outside = 1.0 - inside_lr
+    outside = torch.ones_like(inside_lr) if lr_everywhere else 1.0 - inside_lr
     channels = v_lr.shape[1]
     lr_loss = ((v_lr.float() - (pair["lr"] - eps_lr)) ** 2 * outside).sum() / (outside.sum() * channels).clamp(min=1)
     hr_loss = ((v_hr.float() - (pair["hr"] - eps_hr)) ** 2 * inside_hr).sum() / (inside_hr.sum() * channels).clamp(min=1)
@@ -178,7 +182,7 @@ def train_lora(args) -> None:
                 for sigma in (0.3, 0.6, 0.9):
                     gen = torch.Generator("cuda").manual_seed(1000 + number)
                     v_lr, v_hr, e_lr, e_hr = step_forward(dit, pair, mask, sigma, maps, res_embed, gen)
-                    _loss, lr_loss, hr_loss = eq2_loss(v_lr, v_hr, pair, e_lr, e_hr, mask, 1.0)
+                    _loss, lr_loss, hr_loss = eq2_loss(v_lr, v_hr, pair, e_lr, e_hr, mask, 1.0, args.lr_everywhere)
                     totals["lr"].append(float(lr_loss))
                     totals["hr"].append(float(hr_loss))
         record = {"step": step, "eval_lr": sum(totals["lr"]) / len(totals["lr"]),
@@ -199,7 +203,7 @@ def train_lora(args) -> None:
             mask, kind = pick_mask(pair, args.mask, rng, args.box_p)
             sigma = float(sample_sigma(args.shift, "cpu", count=1)[0])
             v_lr, v_hr, e_lr, e_hr = step_forward(dit, pair, mask, sigma, maps, res_embed, generator)
-            loss, lr_loss, hr_loss = eq2_loss(v_lr, v_hr, pair, e_lr, e_hr, mask, args.hr_weight)
+            loss, lr_loss, hr_loss = eq2_loss(v_lr, v_hr, pair, e_lr, e_hr, mask, args.hr_weight, args.lr_everywhere)
             (loss / args.accum).backward()
             total += float(loss.detach()) / args.accum
         if not math.isfinite(total):
@@ -350,11 +354,12 @@ def train_region(args) -> None:
 
 
 def boundary_ring(mask_hr: torch.Tensor, radius: int) -> torch.Tensor:
-    """``(1, 1, T, H, W)`` float: 1 within ``radius`` latent pixels of the region edge."""
-    flat = mask_hr[:, :, 0]
+    """``(1, 1, T, H, W)`` float: 1 within ``radius`` latent pixels of the region edge, per latent frame."""
+    _b, _c, frames, height, width = mask_hr.shape
+    flat = mask_hr[0, 0][:, None]                                          # (T, 1, H, W)
     grown = F.max_pool2d(flat, 2 * radius + 1, stride=1, padding=radius)
     shrunk = -F.max_pool2d(-flat, 2 * radius + 1, stride=1, padding=radius)
-    return (grown - shrunk).unsqueeze(2)
+    return (grown - shrunk)[:, 0][None, None]
 
 
 def train_decoder(args) -> None:
@@ -396,10 +401,10 @@ def train_decoder(args) -> None:
         if pixel:
             # A crop centred on a boundary pixel: the VAE decoder sees consistent neighbours there or not.
             size = args.crop
-            edge = torch.nonzero(ring[0, 0, 0] > 0)
+            edge = torch.nonzero(ring[0, 0] > 0)                       # (frame, y, x) over every latent frame
             height, width = hr.shape[-2:]
             if len(edge):
-                cy, cx = edge[rng.randrange(len(edge))].tolist()
+                _frame, cy, cx = edge[rng.randrange(len(edge))].tolist()
             else:
                 cy, cx = height // 2, width // 2
             top = min(max(0, cy - size // 2), max(0, height - size))
@@ -410,7 +415,8 @@ def train_decoder(args) -> None:
                 want = vae.decode(hr[window].to(vae_dtype)).float()
             out["pixel"] = (got - want).abs().mean()
             if perceptual is not None:
-                out["lpips"] = perceptual(got[:, :, 0].clamp(-1, 1), want[:, :, 0].clamp(-1, 1)).mean()
+                frames = lambda x: x[0].permute(1, 0, 2, 3).clamp(-1, 1)      # (F, 3, h, w): every pixel frame
+                out["lpips"] = perceptual(frames(got), frames(want)).mean()
         return out
 
     def total_of(parts):
@@ -494,6 +500,8 @@ def main() -> None:
     parser.add_argument("--shift", default="3.0",
                         help="training sigma density (h3_musubi.sample_sigma): a float shift, sigmoid, lognorm:S")
     parser.add_argument("--hr-weight", type=float, default=1.0)
+    parser.add_argument("--lr-outside-only", dest="lr_everywhere", action="store_false",
+                        help="lora: the paper's eq. 2 (LR loss outside M only). Default supervises the LR track everywhere")
     parser.add_argument("--accum", type=int, default=1)
     # region
     parser.add_argument("--train", type=Path, default=None, help="region: states from this train_tt lora dir")

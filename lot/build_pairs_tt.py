@@ -16,8 +16,9 @@ Input: an H3 still or clip cache from ``build_cache_h3.py`` (``*_minimaxh3.safet
   same grid (the paper labels the main subject with an LLM + Grounded SAM; people are the subject
   in this data).
 
-A clip (T latent frames) gets ``(T, h, w)`` masks: each latent frame is labelled on the last pixel
-frame it decodes to (H3 packs 1, then 4, pixel frames per latent frame).
+A clip (T latent frames) gets ``(T, h, w)`` masks: each latent frame's mask is the union over the pixel
+frames it decodes to (H3's cycle is 1, 4, 4, 4, 4 pixel frames per latent frame), so its HR tokens cover
+the subject wherever it moves within that span.
 
 Writes ``<stem>_tt.safetensors`` and ``index.json`` (stem, pair file, text file, caption, face
 and subject token counts) under ``--out``. Resumable. The masks are what ``train_tt.py lora``
@@ -386,21 +387,25 @@ def main() -> None:
             lr = vae.down(hr)
             video = vae.vae.decode(hr.to(vae.dtype))[0].float().clamp(-1, 1)          # (3, F, H, W)
         from h3_musubi import pixel_frames
-        picks = [pixel_frames(k + 1) - 1 for k in range(hr.shape[2])]               # last pixel frame per latent frame
+        spans = [range(pixel_frames(k), min(pixel_frames(k + 1), video.shape[1])) for k in range(hr.shape[2])]
         faces_t, subjects_t = [], []
         subject_class = "person" if people is not None else ""
         caption = caption_for(str(te_path)) if subjects is not None else None
-        for pick in picks:
-            pixels = video[:, min(pick, video.shape[1] - 1)]
-            rgb = ((pixels.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).round().astype(np.uint8)
-            face_k = boxes_to_tokens(faces.boxes(rgb), rgb.shape[0], rgb.shape[1], args.grow)
-            if subjects is not None:
-                pixel_mask, subject_class = subjects.mask(rgb, caption)
-                subject_k = pixels_to_tokens(pixel_mask, args.subject_grow)
-            elif people is not None:
-                subject_k = pixels_to_tokens(people.mask(rgb), args.subject_grow)
-            else:
-                subject_k = torch.zeros_like(face_k)
+        for span in spans:
+            face_k = subject_k = None
+            for pick in span:                                                     # union over the span's pixel frames
+                pixels = video[:, pick]
+                rgb = ((pixels.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).round().astype(np.uint8)
+                face_p = boxes_to_tokens(faces.boxes(rgb), rgb.shape[0], rgb.shape[1], args.grow)
+                if subjects is not None:
+                    pixel_mask, subject_class = subjects.mask(rgb, caption)
+                    subject_p = pixels_to_tokens(pixel_mask, args.subject_grow)
+                elif people is not None:
+                    subject_p = pixels_to_tokens(people.mask(rgb), args.subject_grow)
+                else:
+                    subject_p = torch.zeros_like(face_p)
+                face_k = face_p if face_k is None else face_k | face_p
+                subject_k = subject_p if subject_k is None else subject_k | subject_p
             faces_t.append(face_k)
             subjects_t.append(subject_k)
         face, subject = torch.cat(faces_t), torch.cat(subjects_t)

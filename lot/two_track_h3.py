@@ -227,14 +227,21 @@ class VaeUpscaler:
 
 
 def mask_to_latent(mask: torch.Tensor, scale: int, feather: float = 0.0) -> torch.Tensor:
-    """LR-token mask ``(T, h, w)`` -> ``(1, 1, T, h*scale, w*scale)`` float, optionally feathered inward."""
+    """LR-token mask ``(T, h, w)`` -> ``(1, 1, T, h*scale, w*scale)`` float, optionally feathered inward.
+
+    The feather is a ramp inside the region only (outside it the HR track was never denoised): weight
+    ``1/R`` on the edge cell, rising by ``1/R`` per cell of depth, 1 from depth ``R - 1`` on. Every region
+    cell keeps weight > 0, and a region at least ``2R`` cells across reaches full weight in its middle.
+    (The old erode-then-blur left 40% of a 30% box below full weight and zeroed regions 2 tokens wide.)"""
     up = mask.float().repeat_interleave(scale, 1).repeat_interleave(scale, 2)
-    if feather > 0:
-        # Erode by the feather radius, then blur: the blend stays inside the region the HR track denoised.
-        radius = int(round(feather))
-        eroded = -F.max_pool2d(-up[:, None], 2 * radius + 1, stride=1, padding=radius)
-        kernel = torch.ones(1, 1, 2 * radius + 1, 2 * radius + 1) / (2 * radius + 1) ** 2
-        up = F.conv2d(F.pad(eroded, (radius,) * 4, mode="replicate"), kernel)[:, 0]
+    radius = int(round(feather))
+    if radius > 1:
+        level = up[:, None]
+        total = level.clone()
+        for _ in range(radius - 1):
+            level = -F.max_pool2d(-level, 3, stride=1, padding=1)        # erode one cell (edge of frame counts as inside)
+            total = total + level
+        up = (total / radius)[:, 0]
     return up[None, None]
 
 
@@ -297,12 +304,21 @@ def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, 
         on_mask(mask)
     tokens = [tok_h * tok_w * latent_t] * switch
     if not mask.any() or switch >= steps:
-        return up(lr), {"mask": mask, "tokens": tokens + [tok_h * tok_w * latent_t] * (steps - switch)}
+        # No region: finish the LR schedule with the base model, then upscale the clean latent.
+        lr_gen = torch.Generator("cuda").manual_seed(seed + 3)
+        for index in range(switch, steps):
+            sigma, sigma_next = float(sigmas[index]), float(sigmas[index + 1])
+            velocity, _ = two_track_forward(dit, lr, None, None, 1.0 - sigma, text, audio_generator=lr_gen,
+                                            res_embed=res_embed)
+            x0 = lr + sigma * velocity.float()
+            lr = x0 + (sigma_next / sigma) * (lr - x0)
+            tokens.append(tok_h * tok_w * latent_t)
+        return up(lr), {"mask": mask, "tokens": tokens}
     plan = TwoTrackPlan(mask).to("cuda")
     gen = torch.Generator("cuda").manual_seed(seed + 2)
     audio_gen = torch.Generator("cuda").manual_seed(seed + 3)
     sigma = float(sigmas[switch])
-    # At the switch the HR latent is mostly noise (sigma 0.8 at 16 of 20), so a latent x2 interpolation
+    # At the switch the HR latent is mostly noise (sigma 0.75 at 16 of 20 on shift 12), so a latent x2 interpolation
     # can stand in for the VAE round trip (5 s for 7 latent frames on a 5090): switch_upscale="latent".
     start = up(x0_lr) if switch_upscale == "vae" else F.interpolate(
         x0_lr.float(), scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
@@ -322,7 +338,12 @@ def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, 
     if decoder is not None:
         upscaler, mixer = decoder
         inside = mask_to_latent(mask, 2).to("cuda")                     # LR latent grid
-        filled = (1.0 - inside) * lr + inside * upscale.down(hr)        # their eq. 5: fill M with D(z_h)
+        # Outside M the HR latent is still switch-sigma noise (v_hr is zero there). D only feeds M, but the
+        # VAE's receptive field reaches past the edge, so fill the outside with a latent x2 of the LR track.
+        inside_hr = mask_to_latent(mask, 4).to("cuda")
+        context = F.interpolate(lr.float(), scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+        clean_hr = inside_hr * hr + (1.0 - inside_hr) * context
+        filled = (1.0 - inside) * lr + inside * upscale.down(clean_hr)  # their eq. 5: fill M with D(z_h)
         latent = mixer(hr, upscaler(filled), mask_to_latent(mask, 4).to("cuda"))
         return latent, {"mask": mask, "tokens": tokens}
     weight = mask_to_latent(mask, 4, feather).to("cuda")
@@ -437,6 +458,9 @@ def render(args) -> None:
         head = RegionHead(saved["hidden"]).cuda().eval()
         head.load_state_dict(saved["state"])
         args.block = saved["block"]
+        if args.train and saved.get("train") in (None, "None", ""):
+            print("LOT_H3 kind=warning msg=region head was trained on the base model's states, but --train turns the "
+                  "LoRA on for the LR steps too; retrain it with train_tt.py region --train", flush=True)
     from h3_musubi import latent_frames
     width, height = args.size
     latent_t = latent_frames(args.frames)
@@ -788,7 +812,8 @@ def main() -> None:
     parser.add_argument("--box", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--floor", type=float, default=None)
-    parser.add_argument("--feather", type=float, default=4.0, help="paste-edge blend radius, latent pixels")
+    parser.add_argument("--feather", type=float, default=4.0,
+                        help="paste-edge ramp inside the region, HR latent pixels (weight 1/R at the edge, 1 from R-1 deep)")
     parser.add_argument("--outline", action="store_true", help="draw the region boundary on the two_track image")
     parser.add_argument("--block", type=int, default=MID_BLOCK)
     parser.add_argument("--fraction", type=float, default=0.25)

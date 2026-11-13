@@ -13,7 +13,7 @@ Two implementations are here:
 
 | Script | LR track | Status |
 |---|---|---|
-| [`lot/two_track_h3.py`](../lot/two_track_h3.py) | The unmodified H3 model at half resolution, as in the paper. HR tokens exist only on `M`. No LoT adapter. | Clean, coherent images with no fine-tuning. Faces are only as good as the LR track draws them (see below). |
+| [`lot/two_track_h3.py`](../lot/two_track_h3.py) | The H3 model at half resolution for the whole frame (in the paper the LR track is the fine-tuned model and has no tokens inside `M`; see [TWO_TRACK_FLOW.md](TWO_TRACK_FLOW.md) section 8). HR tokens exist only on `M`. No LoT adapter. | Clean, coherent images with no fine-tuning. Faces are only as good as the LR track draws them (see below). |
 | [`lot/mixed_res_h3.py`](../lot/mixed_res_h3.py) | LoT merged tokens from a `train_h3` run, with the three pieces adapted to LoT's single mixed-extent sequence. | Output is smeared: it inherits the LoT adapter's coarse regions, which are already soft without these additions. |
 
 Both use [`lot/mixed_res.py`](../lot/mixed_res.py) (attention, region head, mixer; model-agnostic and covered by CPU tests).
@@ -22,7 +22,7 @@ Both use [`lot/mixed_res.py`](../lot/mixed_res.py) (attention, region head, mixe
 
 | Paper | Here |
 |---|---|
-| LR = base model at half resolution | Same: 672×384 for a 1344×768 still. H3's rotary positions are normalised by `sqrt(area)`, so both grids share one coordinate frame. |
+| LR = the fine-tuned model at half resolution, outside `M` only | Differs: the base model (or base + LoRA with `--train`) on the whole frame, so the LR track never sees HR. Size: 672×384 for a 1344×768 still. H3's rotary positions are normalised by `sqrt(area)`, so both grids share one coordinate frame. |
 | Dual-resolution attention, maps before RoPE | Same for HR queries (`two_track_attention`). LR queries see only LR keys, so the LR track is exactly the base model and no `f_down` is needed. |
 | Maps ridge-initialised on paired K/V | Same (`fit-kv`, full rank). The fit is weak: relative residual 0.52 on keys and 0.89 on values on 200 images (copying gives 0.61 and 1.07), the same as on 24 images. The paper reports cosine 0.94 for keys and 0.75 for values on Wan. |
 | DiT + maps + resolution embedding fine-tuned | A rank-16 LoRA with the same loss (`train_tt.py lora`). A first run on an RTX 5090 was stopped at step 500, with held-out loss down 21% (LR) and 26% (HR); no quality result yet. See [TRAINING.md](TRAINING.md). |

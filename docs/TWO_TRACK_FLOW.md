@@ -1,4 +1,5 @@
-<!-- Built by: Claude Code (claude-opus-5-5), 2026-11-13. Written for a design cross-check. -->
+<!-- Built by: Claude Code (claude-opus-5-5), 2026-11-13. Written for a design cross-check.
+Updated by: Claude Code (claude-opus-5-5), 2026-11-13. Corrections and fixes from the cross-check by Claude Code (claude-fable-5-2); see section 8. -->
 # Two-track flow on H3: design, implementation, measurements
 
 This document lays out the paper's design, this port's implementation, and measurements, so a reviewer can check
@@ -14,23 +15,28 @@ See [MPEG_DIFFUSION.md](MPEG_DIFFUSION.md) for the paper summary.
 2. A linear region head `s = wᵀ LN(h)` on a middle block's LR states is smoothed and thresholded at
    `m + α(p − m)`. This gives the high-resolution (HR) region `M`, a set of space-time tokens.
 3. The clean LR estimate is upscaled to HR and re-noised to the current sigma.
-4. The remaining steps run both tracks in one sequence. The LR track covers the whole frame; the HR track covers
-   only `M`. Attention is dual-resolution (their eq. 3):
+4. The remaining steps run both tracks in one sequence. The LR track covers only the area outside `M`; the HR
+   track covers only `M` ("HR and LR tokens are only generated in their respective regions"). Attention is
+   dual-resolution (their eqs. 3–4):
    - each query reads keys and values at its own resolution;
-   - missing keys and values come from linear maps `f_up` / `f_down`, applied before RoPE;
+   - missing keys and values come from linear maps applied before RoPE: `f_up` gives HR queries the LR area,
+     `f_down` gives LR queries the HR area;
    - Prop. 1: a shared K/V is exact only when the merged tokens are identical.
 5. A mixed-resolution decoder (`U` upsampler plus 3D-conv mixer `G`, their eqs. 5–6) merges the HR region with the
    upsampled LR frame.
 
 Training: a full DiT fine-tune together with the K/V maps and learned LR/HR resolution embeddings (Wan2.1, 1,250
 steps on 64 B200s). Each video is encoded at both resolutions and noised to the same level. Each latent is
-supervised only on its own region (their eq. 2: LR outside `M`, HR inside `M`). `k` is 25 or 40 of 50 steps.
-Reported: 4.8× on Wan 14B.
+supervised only on its own region (their eq. 2: LR outside `M`, HR inside `M`). In DiT training `M` is the 25% of
+tokens per latent frame with the highest perceptual (LPIPS) label; the LLM + Grounded SAM labels are for the
+region head. `k` is 25 or 40 of 50 steps. Reported: 3.8× and 4.8× denoising time on one B200, on 81-frame clips at
+480p and 720p (tens of thousands of tokens), with a learned latent upscaler and the VAE outside the timing.
 
 ## 2. The port: one sampling run, with shapes for a 22-frame 1344×768 clip
 
 H3 constants used below:
-- VAE: ×16 spatial. 1, then 4, pixel frames per latent frame, so 22 pixel frames → `latent_t = 7`.
+- VAE: ×16 spatial. Pixel frames per latent frame cycle 1, 4, 4, 4, 4, so 22 pixel frames → `latent_t = 7`
+  (spans 1, 4, 4, 4, 4, 1, 4).
 - Patch: 2×2, so one token covers 32 px at HR and 64 px at LR.
 - Sigma schedule: shift 12.
 
@@ -52,7 +58,7 @@ flowchart TD
     G --> H["steps k..: one packed sequence<br/>[text, audio, LR video (all 1,764), HR video (only M: 4 per LR token)]"]
     H --> I["dual-resolution attention (mixed_res.two_track_attention)"]
     I --> J["Euler on lr and on hr (hr only where M)"]
-    J --> K["end: latent = w·hr + (1−w)·U(lr)<br/>w = feathered M at HR latent res<br/>(or train_tt decoder: U and G)"]
+    J --> K["end: latent = w·hr + (1−w)·U(lr)<br/>w = M with a ramp inside its edge, at HR latent res<br/>(or train_tt decoder: learned U and G, plus a VAE D(hr) for eq. 5)"]
     K --> L["VAE decode -> mp4"]
 ```
 
@@ -78,14 +84,20 @@ Code: `lot/two_track_h3.py`:
     is a plain copy; otherwise `k + U Vᵀ k` (low rank), fitted by `fit-kv`.
   - The grid is roped at the HR grid's positions.
 - **Positions:** H3's rotary positions are normalised by `sqrt(area)`, so the LR and HR grids share one coordinate
-  frame.
+  frame. An LR token sits at its top-left HR cell, H3's own convention at both resolutions.
+- **LR queries never see HR.** This is the main deviation from the paper (section 8, Q1): the LR track is complete,
+  including LR tokens inside `M`, so it needs no `f_down`, and the LR picture of the region evolves on its own.
 - **Time:** T is a real dimension. `M` is `(T, h, w)`, and HR tokens exist per latent frame. HR queries see the
   whole clip's HR grid, every frame.
 
 ### Region (`region_mask`, `RegionHead`)
 
 - The head reads block 25's LR video states at the switch step.
-- Smoothing is spatial, per frame. The threshold `m + α(p − m)` is computed over the whole video (`temporal=True`).
+- Smoothing is a spatial Gaussian per frame plus, with `temporal=True` (the default), a `[1, 2, 1] / 4` filter
+  across latent frames. The threshold `m + α(p − m)` is always computed over the whole video. This matches the
+  paper's eq. 8 ("in space and time", "relative to each video's own scores"). The ComfyUI node now does the same.
+- `--floor` (the paper's "stay fully LR" fallback) is off by default. An empty region now finishes the LR schedule
+  instead of returning a latent still at the switch sigma.
 - So far the head is trained on stills only. `docs/REGION_HEAD.md` covers it: caption-guided subject masks, and a
   linear probe on frozen features.
 
@@ -96,9 +108,9 @@ Code: `lot/two_track_h3.py`:
 | Full DiT fine-tune | LoRA rank 16 on qkv / out / fc1 / fc2 |
 | K/V maps, trained | `UpMaps`, ridge-initialised by `fit-kv`, then trained with the LoRA |
 | Resolution embedding | Two zero-initialised vectors (`ResolutionEmbedding`) added to LR / HR video rows |
-| Eq. 2 loss | `eq2_loss`: LR loss outside `M` plus HR loss inside `M`, in H3's `x0 − eps` velocity |
+| Eq. 2 loss | `eq2_loss`: HR loss inside `M`, plus LR loss **everywhere** by default, because the port keeps LR tokens inside `M` and every LR query reads them. `--lr-outside-only` is the paper's eq. 2 |
 | Pairs: video encoded at both resolutions | `build_pairs_tt.py`: `hr` = cached latent, `lr` = `U.down(hr)` (decode, area ×0.5, encode) |
-| `M` from LLM + Grounded SAM | YuNet faces, YOLO / YOLOE people or caption-guided subject masks, on the LR token grid, else a random box |
+| `M` for DiT training: top 25% of tokens per latent frame by LPIPS label | YuNet faces, YOLO / YOLOE people or caption-guided subject masks, on the LR token grid, else a random box. A different share distribution from the paper's |
 | Decoder `U`, `G` | `train_tt.py decoder` (not yet trained) |
 
 Status:
@@ -106,8 +118,8 @@ Status:
   Render quality hasn't been evaluated.
 - **Region head:** v3, trained on stills.
 - **Clips (as of 2026-11-13):**
-  - `build_pairs_tt.py` now accepts clips. It labels each latent frame on the last pixel frame it decodes to,
-    giving masks `(T, h, w)`.
+  - `build_pairs_tt.py` now accepts clips. Each latent frame's mask is the union over the pixel frames it decodes
+    to, giving masks `(T, h, w)`.
   - `train_tt.py` random boxes now span every frame.
   - No clip cache exists yet at 1344×768, so neither has been run on clips.
 
@@ -117,7 +129,7 @@ The node does the same flow on Comfy's own H3 model; it doesn't import this repo
 - `_predict_lr` is the base forward, plus a hook that captures block 25.
 - `_predict_pair` builds the packed sequence and runs `_two_track_attention`.
 - `_vae_upscale` is `U`.
-- `_paste` is the feathered merge.
+- `_paste` is the merge, with the same inside-only ramp as the repo.
 
 Limits:
 - no `f_up` maps, no LoRA, no trained decoder;
@@ -163,7 +175,16 @@ Per piece, 7 latent frames:
 | `U` round trip (decode, ×2, encode) | **5.29 s** |
 | VAE decode, full res | 2.06 s |
 
-So the default two-track run is about 16 × 0.73 + 2 × 5.29 + 6 × 1.71 ≈ 32 s, of which the two `U` calls are 33%.
+Modelled from the per-piece times, the default two-track run is 16 × 0.73 + 2 × 5.29 + 6 × 1.71 ≈ 32 s; the
+measured run is 35.6–36.0 s. Every variant carries the same unexplained 3–4.5 s per run (full res: 41.4 s
+modelled, 45.4 s measured), a fixed cost still to be profiled.
+
+Denoising time only, the paper's measure: 20 × 2.07 = 41.4 s against 16 × 0.73 + 6 × 1.71 = 21.9 s, so **1.9×**,
+at a token ratio of 37% (theirs: 30% at `k` = 40).
+
+A fit of the two step times gives a fixed cost of about 0.28 s per step that does not shrink with fewer tokens
+(block streaming and per-step overhead), so an LR step is at most about 2.8× cheaper than a full step here. At
+7,056 tokens the paper's 4.8× is out of reach whatever else changes; it needs longer clips.
 
 Observations:
 - Clips are coherent across frames. The composition comes from the LR track.
@@ -185,8 +206,9 @@ Observations:
 5. **Schedule.** The paper uses `k` = 40 of 50. With shift 12, few low-sigma steps remain after the switch, which
    is why there is `--hr-steps` (linear in sigma).
 
-Projected, still untested: removing both `U` calls brings the run from 32 s to about 22 s against 45 s for full
-resolution, so **about 2×**. With a 15–20% region and no block streaming, about 2.5–3×.
+Projected, still untested, like for like: removing both `U` calls, finding the fixed per-run cost and switching
+at 18 with 4 HR steps gives about 20 s against 41–45 s, so **2.0–2.2×** at 22 frames. A smaller region and no
+block streaming add a little more; the ratio grows with clip length.
 
 ## 7. Questions for the cross-check
 
@@ -207,3 +229,38 @@ resolution, so **about 2×**. With a 15–20% region and no block streaming, abo
    the same length for both tracks. Any interaction there?
 8. **Timing method.** Wall time includes `U` and the text conditioning. Is a per-step token-compute comparison the
    fairer number to compare with the paper's 4.8×?
+
+## 8. Cross-check results (Claude Code, claude-fable-5-2, 2026-11-13)
+
+The review read the paper through a summary with short quotes, so its paper claims rest on those quotes.
+
+| # | Verdict |
+|---|---|
+| 1 | **Deviation.** In the paper LR tokens exist only outside `M` and LR queries read HR through `f_down`. Harmless untrained at a late switch; harmful once trained or at an earlier switch (LR and HR pictures of the region drift apart). |
+| 2 | Match: one selection at `k`, smoothing in space and time, threshold per video. |
+| 3 | Unverified; fresh noise is the safe choice. The port's switch 16 of 20 re-noises at 0.75; switch 18 (0.545) is closer to their `k` = 40 of 50. |
+| 4 | Harmless: the LR latent carries one extra VAE generation of softening. |
+| 5 | Unverified; union over the latent frame's pixel frames recommended (now done). |
+| 6 | Unverified; training volume (500 steps against 1,250 on 64 B200s) is likely a bigger gap than rank 16. |
+| 7 | Harmless (silent audio; HR queries see audio positions from the LR layout, negligible). |
+| 8 | Neither number as stated. Like for like it is 1.9× denoise-only (section 5). |
+
+Fixed after the review:
+- **Feather discarded HR output.** The erode-then-blur gave a 30% box a mean HR weight of 0.60 and zeroed regions 2
+  tokens wide. Now a ramp inside the region: 0.84 mean on the same box, and every region cell keeps weight > 0.
+  Repo and node.
+- **Empty region returned noise.** It now finishes the LR schedule. Repo and node.
+- **The decoder path ran `D` on a latent still noisy outside `M`.** The outside is now filled with a latent ×2 of
+  the LR track before `D`.
+- **Decoder training on clips used frame 0 only.** The boundary ring, crop centre and LPIPS now use every frame.
+- **LR rows inside `M` were unsupervised.** Now supervised by default (`--lr-outside-only` restores eq. 2).
+- **Region head against LoRA.** `render` warns when `--train` turns the LoRA on for the LR steps but the head was
+  trained on base-model states.
+- **Clip labels.** Union over each latent frame's pixel frames.
+- **Node clip masks.** The node now applies the temporal `[1, 2, 1] / 4` smoothing.
+- **Docs.** Sections 1–6 are corrected: the LR track, DiT-training `M`, the frame cycle, smoothing, sigma 0.75, and
+  like-for-like speed.
+
+Open, needing GPU runs: the paper's LR-outside-`M` design with `f_down`; replacing the VAE round trips (learned
+`LatentUpscaler`, or a crop to `M`'s bounding box); the per-run fixed cost; switch 18 with the trained LoRA;
+and the two-track attention overhead (about 0.41 s per step for the grid build, gather and second attention).
