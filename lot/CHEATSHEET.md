@@ -149,7 +149,7 @@ LOT_H3_TRAIN=1 python3 lot/train_h3.py --pairs $P --init $R --dual $O/up_maps.pt
 
 ## 7. Two-track mixed resolution (the paper's own arrangement): train it
 
-`lot/two_track_h3.py` runs the unmodified H3 at half resolution (LR track) and adds full-resolution (HR) tokens only on a region, with dual-resolution attention. Untrained, it renders clean images, but faces are only as good as the LR track draws them: the HR track joins at step 18 of 20 and can only add texture. Training lets it join earlier and redraw the face. The background and the paper's recipe are in the [README](../README.md#mixed-resolution-following-mpeg-diffusion).
+`lot/two_track_h3.py` runs the unmodified H3 at half resolution (LR track) and adds full-resolution (HR) tokens only on a region, with dual-resolution attention. Untrained, it renders clean images, but faces are only as good as the LR track draws them: the HR track joins at step 18 of 20 and can only add texture. Training lets it join earlier and redraw the face. The background and the paper's recipe are in the [README](../docs/MPEG_DIFFUSION.md).
 
 ### One command, from a fresh machine
 
