@@ -75,8 +75,8 @@ All rows: 1344×768, wall time **including the VAE decode**, fitted K/V maps plu
 | Turbo, full resolution | 857 s (14 min 17 s) |
 | **Turbo + two-track** | **244.5 s (3.5×)** |
 
-The two-track sample also has much less camera movement than the full-res one, which cuts to close-ups. One prompt
-cannot tell whether two-track tends to calm motion; this needs more prompts.
+A second prompt (adults on a sofa): 847 s against 232 s (3.65×). In both 15 s samples the two-track clip keeps one steady
+wide shot while full resolution cuts to close-ups. Two prompts cannot tell whether two-track tends to calm camera motion.
 
 **Quality notes:**
 - Subjects in the region are sharp, with no seams or flicker.
