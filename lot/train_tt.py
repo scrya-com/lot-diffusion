@@ -64,15 +64,16 @@ from two_track_h3 import (EXTENT, HEAD_DIM, MID_BLOCK, ResolutionEmbedding, mask
 # --------------------------------------------------------------------------- masks
 
 
-def random_box(height: int, width: int, rng: random.Random, share: float = 0.25) -> torch.Tensor:
-    """``(1, h, w)`` bool box covering about ``share`` of the LR token grid, random aspect and place."""
+def random_box(height: int, width: int, rng: random.Random, share: float = 0.25, frames: int = 1) -> torch.Tensor:
+    """``(frames, h, w)`` bool box covering about ``share`` of the LR token grid, random aspect and place,
+    the same in every latent frame."""
     area = share * height * width
     aspect = math.exp(rng.uniform(-0.7, 0.7))
     box_h = max(1, min(height, round(math.sqrt(area / aspect))))
     box_w = max(1, min(width, round(area / box_h)))
     top, left = rng.randint(0, height - box_h), rng.randint(0, width - box_w)
-    mask = torch.zeros(1, height, width, dtype=torch.bool)
-    mask[0, top:top + box_h, left:left + box_w] = True
+    mask = torch.zeros(frames, height, width, dtype=torch.bool)
+    mask[:, top:top + box_h, left:left + box_w] = True
     return mask
 
 
@@ -84,7 +85,7 @@ def pick_mask(pair: dict, kind: str, rng: random.Random, box_p: float) -> tuple[
         for mask in options:
             if mask.any() and not mask.all():
                 return mask, kind
-    return random_box(face.shape[1], face.shape[2], rng), "box"
+    return random_box(face.shape[1], face.shape[2], rng, frames=face.shape[0]), "box"
 
 
 def label_mask(pair: dict, kind: str) -> torch.Tensor:

@@ -198,24 +198,32 @@ class ResolutionEmbedding(torch.nn.Module):
 
 
 class VaeUpscaler:
-    """``U``: decode, bicubic x2, encode. Stills only (one latent frame)."""
+    """``U``: decode, bicubic x2 per frame, encode. A still or a clip (any latent frame count)."""
 
     def __init__(self, vae):
         self.vae = vae
         self.dtype = next(vae.parameters()).dtype
 
     @torch.no_grad()
-    def __call__(self, latent: torch.Tensor) -> torch.Tensor:
-        pixels = self.vae.decode(latent.to("cuda", self.dtype))[:, :, 0].float().clamp(-1, 1)
-        pixels = F.interpolate(pixels, scale_factor=2, mode="bicubic", align_corners=False).clamp(-1, 1)
-        return self.vae.encode(pixels.to(self.dtype)).float()
+    def _resample(self, latent: torch.Tensor, **interp) -> torch.Tensor:
+        pixels = self.vae.decode(latent.to("cuda", self.dtype)).float().clamp(-1, 1)      # (1, 3, F, H, W)
+        if latent.shape[2] == 1:
+            pixels = pixels[:, :, :1]
+        b, c, f, h, w = pixels.shape
+        frames = pixels.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w)
+        frames = F.interpolate(frames, **interp).clamp(-1, 1)
+        pixels = frames.reshape(b, f, c, *frames.shape[-2:]).permute(0, 2, 1, 3, 4)
+        out = self.vae.encode((pixels[:, :, 0] if f == 1 else pixels).to(self.dtype)).float()
+        if out.shape[2] != latent.shape[2]:
+            raise RuntimeError(f"VAE round trip changed latent frames {latent.shape[2]} -> {out.shape[2]}")
+        return out
 
-    @torch.no_grad()
+    def __call__(self, latent: torch.Tensor) -> torch.Tensor:
+        return self._resample(latent, scale_factor=2, mode="bicubic", align_corners=False)
+
     def down(self, latent: torch.Tensor) -> torch.Tensor:
         """``D``: decode, area x0.5, encode (the LR latent of a cached HR item)."""
-        pixels = self.vae.decode(latent.to("cuda", self.dtype))[:, :, 0].float().clamp(-1, 1)
-        pixels = F.interpolate(pixels, scale_factor=0.5, mode="area")
-        return self.vae.encode(pixels.to(self.dtype)).float()
+        return self._resample(latent, scale_factor=0.5, mode="area")
 
 
 def mask_to_latent(mask: torch.Tensor, scale: int, feather: float = 0.0) -> torch.Tensor:
@@ -242,12 +250,12 @@ def box_mask(box, frames: int, height: int, width: int) -> torch.Tensor:
 
 @torch.no_grad()
 def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_at=None, block=MID_BLOCK,
-                  res_embed=None):
+                  res_embed=None, latent_t=1):
     """Base-model Euler sampling; returns ``(x, x0_last, states)`` after ``stop`` steps (default all)."""
     from h3_musubi import sigma_schedule
 
     gen = torch.Generator("cuda").manual_seed(seed)
-    x = torch.randn(1, 24, 1, height // 16, width // 16, device="cuda", generator=gen)
+    x = torch.randn(1, 24, latent_t, height // 16, width // 16, device="cuda", generator=gen)
     audio_gen = torch.Generator("cuda").manual_seed(seed + 1)
     sigmas = sigma_schedule(steps)
     x0 = states = None
@@ -266,7 +274,7 @@ def native_sample(dit, text, *, height, width, steps, seed, stop=None, capture_a
 @torch.no_grad()
 def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, maps=None, head=None, box=None,
                      block=MID_BLOCK, alpha=0.5, floor=None, feather=0.0, on_mask=None, hr_steps=None,
-                     res_embed=None, decoder=None):
+                     res_embed=None, decoder=None, latent_t=1, switch_upscale="vae"):
     """The four-stage sampler of the module docstring. Returns ``(latent, info)`` at ``width x height``.
 
     ``decoder`` is ``(U, G)`` from ``train_tt.py decoder``: ``U`` replaces the VAE upscale (at the
@@ -278,23 +286,27 @@ def two_track_sample(dit, text, upscale, *, height, width, steps, switch, seed, 
     sigmas = sigma_schedule(steps)
     lr, x0_lr, states = native_sample(dit, text, height=height // 2, width=width // 2, steps=steps, seed=seed,
                                       stop=switch, capture_at=switch - 1 if head is not None else None, block=block,
-                                      res_embed=res_embed)
+                                      res_embed=res_embed, latent_t=latent_t)
     up = upscale if decoder is None else decoder[0]
     if head is not None:
-        scores = head(states).float().cpu().reshape(1, tok_h, tok_w)
+        scores = head(states).float().cpu().reshape(latent_t, tok_h, tok_w)
         mask = region_mask(scores, alpha=alpha, floor=floor)
     else:
-        mask = box_mask(box or (0.25, 0.25, 0.75, 0.75), 1, tok_h, tok_w)
+        mask = box_mask(box or (0.25, 0.25, 0.75, 0.75), latent_t, tok_h, tok_w)
     if on_mask is not None:
         on_mask(mask)
-    tokens = [tok_h * tok_w] * switch
+    tokens = [tok_h * tok_w * latent_t] * switch
     if not mask.any() or switch >= steps:
-        return up(lr), {"mask": mask, "tokens": tokens + [tok_h * tok_w] * (steps - switch)}
+        return up(lr), {"mask": mask, "tokens": tokens + [tok_h * tok_w * latent_t] * (steps - switch)}
     plan = TwoTrackPlan(mask).to("cuda")
     gen = torch.Generator("cuda").manual_seed(seed + 2)
     audio_gen = torch.Generator("cuda").manual_seed(seed + 3)
     sigma = float(sigmas[switch])
-    hr = (1.0 - sigma) * up(x0_lr) + sigma * torch.randn(1, 24, 1, 2 * lat_h, 2 * lat_w, device="cuda",
+    # At the switch the HR latent is mostly noise (sigma 0.8 at 16 of 20), so a latent x2 interpolation
+    # can stand in for the VAE round trip (5 s for 7 latent frames on a 5090): switch_upscale="latent".
+    start = up(x0_lr) if switch_upscale == "vae" else F.interpolate(
+        x0_lr.float(), scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+    hr = (1.0 - sigma) * start + sigma * torch.randn(1, 24, latent_t, 2 * lat_h, 2 * lat_w, device="cuda",
                                                               generator=gen)
     # After the switch both tracks share the schedule: the model's own, or ``hr_steps`` steps
     # linear in sigma (H3's shift 12 leaves few low-sigma steps, where the HR detail is made).
@@ -425,7 +437,9 @@ def render(args) -> None:
         head = RegionHead(saved["hidden"]).cuda().eval()
         head.load_state_dict(saved["state"])
         args.block = saved["block"]
+    from h3_musubi import latent_frames
     width, height = args.size
+    latent_t = latent_frames(args.frames)
     columns = [c for c in ("hr", "lr", "two_track") if c in args.variants]
     meta = {"timings": {c: [] for c in columns}, "tokens": {c: [] for c in columns}, "hr_share": []}
     args.out.mkdir(parents=True, exist_ok=True)
@@ -440,19 +454,20 @@ def render(args) -> None:
             if network is not None:
                 set_lora(network, name == "two_track")      # the baselines are the base model
             if name == "hr":
-                latent = sample(dit, embeds, height=height, width=width, steps=args.steps, seed=args.seed + index)
-                count = float((height // 32) * (width // 32))
+                latent = sample(dit, embeds, height=height, width=width, steps=args.steps, seed=args.seed + index,
+                                latent_t=latent_t)
+                count = float((height // 32) * (width // 32) * latent_t)
             elif name == "lr":
                 latent, _x0, _s = native_sample(dit, embeds, height=height // 2, width=width // 2, steps=args.steps,
-                                                seed=args.seed + index)
+                                                seed=args.seed + index, latent_t=latent_t)
                 latent = upscale(latent)
-                count = float((height // 64) * (width // 64))
+                count = float((height // 64) * (width // 64) * latent_t)
             else:
                 latent, info = two_track_sample(
                     dit, embeds, upscale, height=height, width=width, steps=args.steps, switch=args.switch,
                     seed=args.seed + index, maps=maps, head=head, box=args.box, block=args.block,
                     alpha=args.alpha, floor=args.floor, feather=args.feather, hr_steps=args.hr_steps,
-                    res_embed=res_embed, decoder=decoder)
+                    res_embed=res_embed, decoder=decoder, latent_t=latent_t, switch_upscale=args.switch_upscale)
                 mask = info["mask"]
                 count = sum(info["tokens"]) / len(info["tokens"])
                 meta["hr_share"].append(round(float(mask.float().mean()), 4))
@@ -460,9 +475,12 @@ def render(args) -> None:
             meta["timings"][name].append(round(time.perf_counter() - start, 2))
             meta["tokens"][name].append(round(count, 1))
             pixels = upscale.vae.decode(latent.to("cuda", upscale.dtype))
+            if latent_t > 1:
+                save_clip(pixels, args.out / f"p{index}_{name}.mp4")
+                pixels = pixels[:, :, pixels.shape[2] // 2:pixels.shape[2] // 2 + 1]       # the grid shows the middle frame
             image = to_image(pixels)
             if mask is not None and args.outline:
-                image = outline(image, mask)
+                image = outline(image, mask[mask.shape[0] // 2:mask.shape[0] // 2 + 1])
             image.save(args.out / f"p{index}_{name}.png")
             row.append(image)
             print(f"LOT_H3 kind=two_track_render prompt={index} variant={name} "
@@ -478,7 +496,7 @@ def render(args) -> None:
         for col, image in enumerate(images):
             sheet.paste(image.resize(cell, Image.LANCZOS), (col * cell[0], 28 + r * cell[1]))
     sheet.save(args.out / "grid.png")
-    meta.update({"columns": columns, "steps": args.steps, "switch": args.switch, "canvas": f"{width}x{height}",
+    meta.update({"columns": columns, "frames": args.frames, "latent_t": latent_t, "steps": args.steps, "switch": args.switch, "canvas": f"{width}x{height}",
                  "maps": str(args.maps), "train": str(args.train), "decoder": str(args.decoder), "region": str(args.region), "box": args.box, "feather": args.feather})
     (args.out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
     print(f"LOT_H3 kind=two_track_render_done out={args.out} ok=1", flush=True)
@@ -565,6 +583,14 @@ def draw_layout(args) -> None:
     (args.out / "layout.json").write_text(json.dumps({"switch": args.switch, "alpha": args.alpha,
                                                       "region": str(args.region), "items": meta}, indent=1) + "\n")
     print(f"LOT_H3 kind=layout_done out={args.out} prompts={len(rows)} ok=1", flush=True)
+
+
+def save_clip(pixels: torch.Tensor, path: Path, fps: int = 24) -> None:
+    """(1, 3, F, H, W) in [-1, 1] -> mp4."""
+    import imageio
+
+    frames = ((pixels[0].float().clamp(-1, 1) + 1) * 127.5).round().byte().permute(1, 2, 3, 0).cpu().numpy()
+    imageio.mimwrite(str(path), list(frames), fps=fps, quality=8, macro_block_size=1)
 
 
 def to_image_from(pixels):
@@ -746,6 +772,10 @@ def main() -> None:
     parser.add_argument("--hr-steps", type=int, default=6,
                         help="steps after the switch, linear in sigma (0: the rest of the schedule)")
     parser.add_argument("--size", type=int, nargs=2, default=(1344, 768), metavar=("W", "H"))
+    parser.add_argument("--switch-upscale", choices=("vae", "latent"), default="vae",
+                        help="render: HR start at the switch: VAE round trip, or latent x2 interpolation (no VAE)")
+    parser.add_argument("--frames", type=int, default=1,
+                        help="render: pixel frames (1 = still; 22 = 7 latent frames). Clips also save p<i>_<variant>.mp4")
     parser.add_argument("--variants", default="hr,lr,two_track")
     parser.add_argument("--maps", type=Path, default=None, help="up_maps_tt.pt from fit-kv (default: copy)")
     parser.add_argument("--train", type=Path, default=None,

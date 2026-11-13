@@ -3,7 +3,7 @@
 
     python3 lot/build_pairs_tt.py --cache DIR --out DIR [--subject yolo] [--items N]
 
-Input: an H3 still cache from ``build_cache_h3.py`` (``*_minimaxh3.safetensors`` latents with
+Input: an H3 still or clip cache from ``build_cache_h3.py`` (``*_minimaxh3.safetensors`` latents with
 ``*_minimaxh3_te.safetensors`` text; ``--cache`` is repeatable). For each item:
 
 - ``hr``: the cached latent, cropped so the LR track has whole 2x2 patches (sides a multiple of 4).
@@ -15,6 +15,9 @@ Input: an H3 still cache from ``build_cache_h3.py`` (``*_minimaxh3.safetensors``
 - ``subject``: with ``--subject yolo``, people found by an Ultralytics segmentation model, on the
   same grid (the paper labels the main subject with an LLM + Grounded SAM; people are the subject
   in this data).
+
+A clip (T latent frames) gets ``(T, h, w)`` masks: each latent frame is labelled on the last pixel
+frame it decodes to (H3 packs 1, then 4, pixel frames per latent frame).
 
 Writes ``<stem>_tt.safetensors`` and ``index.json`` (stem, pair file, text file, caption, face
 and subject token counts) under ``--out``. Resumable. The masks are what ``train_tt.py lora``
@@ -377,24 +380,30 @@ def main() -> None:
             latent = handle.get_tensor(next(k for k in handle.keys() if k.startswith("latent"))).float()
         if latent.ndim == 3:
             latent = latent.unsqueeze(1)
-        if latent.shape[1] != 1:
-            print(f"LOT_H3 kind=pairs_skip stem={stem} reason=clip (stills only)", flush=True)
-            continue
         height, width = latent.shape[-2] // 4 * 4, latent.shape[-1] // 4 * 4
         hr = latent[..., :height, :width].unsqueeze(0).cuda()
         with torch.no_grad():
             lr = vae.down(hr)
-            pixels = vae.vae.decode(hr.to(vae.dtype))[0, :, 0].float().clamp(-1, 1)
-        rgb = ((pixels.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).round().astype(np.uint8)
-        face = boxes_to_tokens(faces.boxes(rgb), rgb.shape[0], rgb.shape[1], args.grow)
+            video = vae.vae.decode(hr.to(vae.dtype))[0].float().clamp(-1, 1)          # (3, F, H, W)
+        from h3_musubi import pixel_frames
+        picks = [pixel_frames(k + 1) - 1 for k in range(hr.shape[2])]               # last pixel frame per latent frame
+        faces_t, subjects_t = [], []
         subject_class = "person" if people is not None else ""
-        if subjects is not None:
-            pixel_mask, subject_class = subjects.mask(rgb, caption_for(str(te_path)))
-            subject = pixels_to_tokens(pixel_mask, args.subject_grow)
-        elif people is not None:
-            subject = pixels_to_tokens(people.mask(rgb), args.subject_grow)
-        else:
-            subject = torch.zeros_like(face)
+        caption = caption_for(str(te_path)) if subjects is not None else None
+        for pick in picks:
+            pixels = video[:, min(pick, video.shape[1] - 1)]
+            rgb = ((pixels.permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5).round().astype(np.uint8)
+            face_k = boxes_to_tokens(faces.boxes(rgb), rgb.shape[0], rgb.shape[1], args.grow)
+            if subjects is not None:
+                pixel_mask, subject_class = subjects.mask(rgb, caption)
+                subject_k = pixels_to_tokens(pixel_mask, args.subject_grow)
+            elif people is not None:
+                subject_k = pixels_to_tokens(people.mask(rgb), args.subject_grow)
+            else:
+                subject_k = torch.zeros_like(face_k)
+            faces_t.append(face_k)
+            subjects_t.append(subject_k)
+        face, subject = torch.cat(faces_t), torch.cat(subjects_t)
         pair_name = f"{stem}_tt.safetensors"
         save_file({"hr": hr[0].half().cpu().contiguous(), "lr": lr[0].half().cpu().contiguous(),
                    "face": face.to(torch.uint8), "subject": subject.to(torch.uint8)}, str(args.out / pair_name))
