@@ -194,11 +194,12 @@ def region_card(repo: str, folder: str, info: dict, log: Path | None, data: str)
                          for k, v, n in pairs)
     base = f"https://huggingface.co/{repo}/blob/main"
     switches = info.get("switches") or [info.get("switch")]
+    use_switch = 16 if switches and 16 in list(switches) else info.get("switch")
     return f"""# Region head: where the subject is, from MiniMax H3's own features
 
 > [!WARNING]
 > **Research checkpoint.** It finds the subject in most test prompts but not all. See *Limits* below.
-> Help and results: [scrya-com/mpeg-diffusion issue #2](https://github.com/scrya-com/mpeg-diffusion/issues/2).
+> Help and results: [issue #5](https://github.com/scrya-com/mpeg-diffusion/issues/5) (which switch step) and [issue #2](https://github.com/scrya-com/mpeg-diffusion/issues/2) (the LoRA).
 
 > [!CAUTION]
 > Derived from MiniMax H3 under the [MiniMax H3 Community License]({base}/LICENSE) (see [`NOTICE`]({base}/NOTICE)):
@@ -223,10 +224,15 @@ frozen; nothing else is trained.
 git clone https://github.com/scrya-com/mpeg-diffusion && cd mpeg-diffusion
 hf download {repo} --include "{folder}/*" --local-dir weights
 # Draw what it picks, and the LoT layout that implies, for held-out captions:
-python3 lot/two_track_h3.py layout --region weights/{folder}/region_head_tt.safetensors --out out --switch 10
-# Or let it pick the full-resolution region in two-track sampling:
-python3 lot/two_track_h3.py render --region weights/{folder}/region_head_tt.safetensors --out out --outline
+python3 lot/two_track_h3.py layout --region weights/{folder}/region_head_tt.safetensors --out out --switch {use_switch}
+# Diffusion pass: LR for the switch, then the HR region for the remaining steps.
+python3 lot/two_track_h3.py render --region weights/{folder}/region_head_tt.safetensors --out out \\
+    --switch {use_switch} --hr-steps 6 --outline
 ```
+
+ComfyUI: [ComfyUI-MiniMax-H3-Image-Lane](https://github.com/scrya-com/ComfyUI-MiniMax-H3-Image-Lane).
+Put this file in `ComfyUI/models/lot/` and load `workflows/mpeg_diffusion_api.json`. The node is
+**MiniMax H3 MPEG Diffusion**. It runs the same pass on the base DiT (no two-track LoRA yet).
 
 ## Training
 
