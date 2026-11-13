@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import random
 import sys
 import time
@@ -856,6 +857,9 @@ def main() -> None:
     parser.add_argument("--switch-upscale", choices=("vae", "crop", "latent"), default="vae",
                         help="render: HR start at the switch: VAE round trip of the frame, of M's bounding box only "
                              "(crop), or latent x2 interpolation (no VAE; striped regions)")
+    parser.add_argument("--preset", choices=("quality",), default=None,
+                        help="render: quality = switch 16, 6 HR steps, crop upscale, pixel paste, and the fitted maps "
+                             "($LOT_TT_MAPS) and region head ($LOT_TT_REGION) unless --maps / --region / --box are given")
     parser.add_argument("--final", choices=("latent", "pixel"), default="latent",
                         help="render: merge the tracks in latent space (a VAE round trip of LR) or in pixel space "
                              "(decode LR at half size, paste after decoding)")
@@ -885,6 +889,16 @@ def main() -> None:
     parser.add_argument("--sigmas", type=float, nargs="+", default=[0.2, 0.4, 0.6, 0.8, 0.95],
                         help="fit-kv: noise levels; cover the sigmas the HR track runs at after the switch")
     args = parser.parse_args()
+    if args.preset == "quality":
+        args.switch, args.hr_steps, args.switch_upscale, args.final = 16, 6, "crop", "pixel"
+        if args.maps is None and args.train is None:
+            path = os.environ.get("LOT_TT_MAPS")
+            if not path or not Path(path).is_file():
+                raise SystemExit("--preset quality needs fitted maps: --maps up_maps_tt.pt (fit-kv) or $LOT_TT_MAPS; "
+                                 "without them the HR region has a diamond-grid grain")
+            args.maps = Path(path)
+        if args.region is None and args.box is None and os.environ.get("LOT_TT_REGION"):
+            args.region = Path(os.environ["LOT_TT_REGION"])
     from gpu_guard import auto_swap
 
     args.swap = auto_swap(args.swap, inference=args.phase in ("render", "layout"))

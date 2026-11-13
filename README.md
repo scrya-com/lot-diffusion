@@ -34,8 +34,9 @@ These are independent ports. They are not the authors' releases.
 |---|---|
 | Two-track sampler (`lot/two_track_h3.py`) | ✅ Works untrained: coherent 1344×768 stills at 281–322 tokens per step, against 1,008 at full resolution |
 | Region head (`train_tt.py region`) | 🔄 Training on the frozen model with caption-guided subject masks ([how it works](docs/REGION_HEAD.md)) |
-| Fine-tune so faces get redrawn (`train_tt.py lora`) | 🔄 First run stopped at step 500, with held-out loss down 21–26%; no quality result yet |
-| Wall-time speedup | ❌ Not yet: same time as full resolution with blocks streamed from CPU |
+| Fine-tune so faces get redrawn (`train_tt.py lora`) | ⚠️ The 500-step LoRA changes the whole picture (washed out); not needed for the quality recipe |
+| Wall-time speedup | ✅ Video: 22 frames at 1344×768 in 14.0 s against 27.2 s at full resolution (**1.94×**, RTX 5090, decode included). Stills: no gain |
+| Quality recipe | ✅ Fitted K/V maps (`fit-kv`, no DiT training) + region head v3: sharp subjects, no seams. `render --preset quality --frames 22` ([TWO_TRACK_FLOW.md](docs/TWO_TRACK_FLOW.md)) |
 | More than two levels for many-megapixel images | 📝 Draft, CPU-tested ([LARGE_IMAGES.md](docs/LARGE_IMAGES.md), [#3](https://github.com/scrya-com/mpeg-diffusion/issues/3)) |
 | Level-of-Token adapters | ⚠️ 2.15–2.85× faster DiT forward, but soft coarse regions ([LEVEL_OF_TOKEN.md](docs/LEVEL_OF_TOKEN.md)) |
 

@@ -235,6 +235,18 @@ about 4 s slower (one-time autotune).
 - The 500-step LoRA (`--train`) changes the whole picture, including the LR composition, into a washed-out
   different image. Do not use it as it stands.
 
+**Quality recipe** (`lot/runs/tt_video/q_head_s16/`, 4 prompts):
+
+```bash
+export LOT_TT_MAPS=/path/to/up_maps_tt.pt LOT_TT_REGION=/path/to/region_head_tt.pt
+python3 lot/two_track_h3.py render --preset quality --frames 22 --out runs/q --prompts 4 --outline
+```
+
+- The head picked 12–29% of the frame.
+- Two-track ran in 11.4–14.0 s against 25 s at full res.
+- Faces are sharp, with no seams and no flicker across the 22 frames.
+- Full res composes differently: it samples at another resolution. Compare quality, not the picture.
+
 Observations:
 - Clips are coherent across frames. The composition comes from the LR track.
 - Untrained, the HR box is grainy (see `lot/runs/tt_video/f22/grid.png` and the mp4s).
