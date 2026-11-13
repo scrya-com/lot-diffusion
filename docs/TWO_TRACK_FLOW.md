@@ -186,6 +186,28 @@ A fit of the two step times gives a fixed cost of about 0.28 s per step that doe
 (block streaming and per-step overhead), so an LR step is at most about 2.8× cheaper than a full step here. At
 7,056 tokens the paper's 4.8× is out of reach whatever else changes; it needs longer clips.
 
+**The per-run fixed cost is a warm-up.** The first step after a change of sequence shape takes 6.2 s instead of
+2.08 s. The render loop alternates shapes (full res, LR, two-track), so every variant paid it. Two full-res runs
+back to back take 45.6 s and then 41.8 s.
+
+**Steady state (2026-11-13).** Warm-up excluded, VAE decode included, two runs each back to back, same prompt and
+box:
+
+| 22 frames, 1344×768, 20 steps | Total | Speedup |
+|---|---|---|
+| Full resolution | 43.9 s (41.8 sampling + 2.1 decode) | 1× |
+| Two-track, full-frame VAE round trips (default) | 34.6 s | 1.27× |
+| Two-track, `--switch-upscale crop --final pixel` | **27.7 s** (25.0 + 2.6 decode and paste) | **1.59×** |
+
+- `crop` round-trips only `M`'s bounding box plus 2 latent px at the switch.
+- `pixel` decodes HR (outside `M` filled with a latent ×2 of LR) and LR at half size, then pastes in pixel space.
+- Quality matches the default on these two prompts: still grainy inside the box (untrained), no visible seam
+  (`lot/runs/tt_video/f22_crop_pixel/grid.png`).
+
+What is left in the 25 s is 16 LR steps (11.7 s), the cropped round trip, and 6 two-track steps (10.3 s). The next
+gains are switch 18 with 4 HR steps (needs the trained LoRA), the two-track attention overhead, and block
+streaming.
+
 Observations:
 - Clips are coherent across frames. The composition comes from the LR track.
 - Untrained, the HR box is grainy (see `lot/runs/tt_video/f22/grid.png` and the mp4s).
