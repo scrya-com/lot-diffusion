@@ -41,7 +41,7 @@ def card_gb() -> float:
     return free / 2**30
 
 
-def auto_swap(value: str, inference: bool = False) -> int:
+def auto_swap(value: str, inference: bool = False, latent_t: int = 7) -> int:
     """``--swap auto``: DiT blocks to stream from CPU, from the card's free memory.
 
     Measured with ``train_tt.py lora --check`` (two-track LoRA, 1344x768 pairs): 8 blocks peak at
@@ -54,6 +54,8 @@ def auto_swap(value: str, inference: bool = False) -> int:
         # Rendering (no LoRA grads, no checkpointing), measured 2026-11-13 on an RTX 5090 at 1344x768, 22 frames,
         # VAE decode included: peak 26.8 GB with every block resident, about 0.42 GB less per streamed block.
         # Streaming costs two-track the most (LR steps are short): 14.0 s at 0-2 streamed, 20.9 s at 8.
-        need = 26.8 + 1.0
+        # Longer clips need more (activations, VAE decode): 22 latent frames (73 pixel frames) ran out of memory
+        # with none streamed and fit with 6. Assumed 0.35 GB per latent frame beyond 7.
+        need = 26.8 + 0.35 * max(0, latent_t - 7) + 1.0
         return 0 if gb >= need else min(50, int(math.ceil((need - gb) / 0.42)))
     return 0 if gb >= 64 else 8 if gb >= 28 else 16 if gb >= 21 else 24

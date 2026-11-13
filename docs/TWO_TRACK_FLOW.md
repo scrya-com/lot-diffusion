@@ -247,6 +247,22 @@ python3 lot/two_track_h3.py render --preset quality --frames 22 --out runs/q --p
 - Faces are sharp, with no seams and no flicker across the 22 frames.
 - Full res composes differently: it samples at another resolution. Compare quality, not the picture.
 
+**Longer clips** (`--preset quality`, region head v3, RTX 5090). Full-res times exclude the decode and two-track
+times include it, so the real gap is a little larger:
+
+| Frames (latent) | Full res | Two-track | Speedup |
+|---|---|---|---|
+| 22 (7) | 25 s | 11.4–14.0 s | 1.8–2.2× |
+| 39 (12) | 52.6 s | 24.9–28.2 s | 1.9–2.1× |
+| 73 (22), 6 blocks streamed | 130–135 s | 48–54 s | **2.4–2.8×** |
+
+The 73-frame clips stay sharp and consistent across all frames (`lot/runs/tt_video/long_f73/`). `--swap auto` now
+adds memory for longer clips.
+
+ComfyUI: the node with `maps` and `region_head_v3` rendered a 22-frame clip in ComfyUI v0.43.1 (51 s for the whole
+workflow, including model loading and text encoding). See `workflows/mpeg_diffusion_video_api.json` in
+ComfyUI-MiniMax-H3-Image-Lane.
+
 Observations:
 - Clips are coherent across frames. The composition comes from the LR track.
 - Untrained, the HR box is grainy (see `lot/runs/tt_video/f22/grid.png` and the mp4s).
