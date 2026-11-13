@@ -247,6 +247,10 @@ python3 lot/two_track_h3.py render --preset quality --frames 22 --out runs/q --p
 - Faces are sharp, with no seams and no flicker across the 22 frames.
 - Full res composes differently: it samples at another resolution. Compare quality, not the picture.
 
+**15 s in ComfyUI** (362 frames, Turbo LoRA v4, 8 steps, int8 convrot VAE, 2026-11-13). Turbo at full res:
+857 s. Turbo + two-track: 244.5 s warm (250 s cold), so 3.5×; the region head picked 14%. The two-track sample has
+less camera motion than the full-res one, which is one prompt, so not yet a finding.
+
 **Longer clips** (`--preset quality`, region head v3, RTX 5090). Full-res times exclude the decode and two-track
 times include it, so the real gap is a little larger:
 

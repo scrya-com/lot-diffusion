@@ -68,7 +68,15 @@ All rows: 1344×768, wall time **including the VAE decode**, fitted K/V maps plu
 | 73 (3 s) | 138 s | 56 s | 2.5× |
 | 145 (6 s) | 398 s | 128 s | 3.1× |
 
-A 15 s clip (362 frames) renders in ComfyUI with Turbo + two-track (250 s, cold start).
+**ComfyUI, 15 s clip (362 frames)**, Turbo LoRA, 8 steps:
+
+| | Time |
+|---|---|
+| Turbo, full resolution | 857 s (14 min 17 s) |
+| **Turbo + two-track** | **244.5 s (3.5×)** |
+
+The two-track sample also has much less camera movement than the full-res one, which cuts to close-ups. One prompt
+cannot tell whether two-track tends to calm motion; this needs more prompts.
 
 **Quality notes:**
 - Subjects in the region are sharp, with no seams or flicker.
